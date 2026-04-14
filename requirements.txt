@@ -1,0 +1,5 @@
+python-telegram-bot>=21.0
+anthropic>=0.30.0
+caldav>=1.4.0
+vobject>=0.9.7
+openai>=1.0.0
