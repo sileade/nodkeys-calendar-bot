@@ -35,6 +35,7 @@ EMAIL_PASSWORD = os.getenv("KINDLE_EMAIL_PASSWORD", "")
 SMTP_LOGIN = os.getenv("ICLOUD_USERNAME", EMAIL_FROM)  # Use iCloud username for SMTP auth
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 TMP_DIR = os.getenv("KINDLE_TMP_DIR", "/tmp/kindle_files")
+BOOKS_STORAGE_DIR = os.getenv("KINDLE_BOOKS_STORAGE", "/app/data/books")
 
 # Formats Kindle accepts directly (no conversion needed)
 KINDLE_NATIVE_FORMATS = {
@@ -88,10 +89,26 @@ def _save_books_history():
         logger.error("Failed to save books history: %s", e)
 
 
+def store_book_file(file_path: str, book_id: int) -> str:
+    """Copy book file to permanent storage. Returns stored path."""
+    try:
+        import shutil
+        os.makedirs(BOOKS_STORAGE_DIR, exist_ok=True)
+        ext = Path(file_path).suffix
+        stored_name = f"{book_id:04d}_{Path(file_path).stem}{ext}"
+        stored_path = os.path.join(BOOKS_STORAGE_DIR, stored_name)
+        shutil.copy2(file_path, stored_path)
+        logger.info("Book stored: %s", stored_path)
+        return stored_name
+    except Exception as e:
+        logger.error("Failed to store book: %s", e)
+        return ""
+
+
 def add_book_to_history(filename: str, title: str, author: str, 
                         format_from: str, format_to: str,
                         kindle_email: str, converted: bool, 
-                        file_size: int):
+                        file_size: int, stored_file: str = ""):
     """Add a book entry to the history."""
     from datetime import datetime
     entry = {
@@ -105,7 +122,8 @@ def add_book_to_history(filename: str, title: str, author: str,
         "kindle_email": kindle_email,
         "file_size_kb": round(file_size / 1024),
         "sent_at": datetime.now().isoformat(),
-        "status": "sent"
+        "status": "sent",
+        "stored_file": stored_file,
     }
     _books_history.append(entry)
     _save_books_history()
@@ -531,6 +549,10 @@ async def callback_kindle(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 result_text += f"🔄 <b>Конвертировано:</b> {file_info['file_ext'].upper()} → {file_info['recommended_output'].upper()}\n"
             result_text += f"\n📬 <i>Книга появится на Kindle через 1-5 минут</i>"
 
+            # Store book file permanently
+            book_id = len(_books_history) + 1
+            stored_file = store_book_file(send_path, book_id)
+
             # Track in books history
             add_book_to_history(
                 filename=file_info['filename'],
@@ -541,6 +563,7 @@ async def callback_kindle(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 kindle_email=kindle_email,
                 converted=converted,
                 file_size=file_info['file_size'],
+                stored_file=stored_file,
             )
 
             await query.edit_message_text(result_text, parse_mode="HTML")
@@ -558,7 +581,7 @@ async def callback_kindle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     finally:
-        # Cleanup temp files
+        # Cleanup temp files (but not stored books)
         try:
             for f in os.listdir(TMP_DIR):
                 fp = os.path.join(TMP_DIR, f)

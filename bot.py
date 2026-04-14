@@ -434,6 +434,56 @@ def get_today_events() -> list[dict]:
     return results
 
 
+def get_week_events() -> list[dict]:
+    """Get all events for the current week (Mon-Sun)."""
+    results = []
+    try:
+        client = get_caldav_client()
+        principal = client.principal()
+        now = datetime.now(TIMEZONE)
+        # Find Monday of current week
+        monday = now - timedelta(days=now.weekday())
+        week_start = monday.replace(hour=0, minute=0, second=0, microsecond=0)
+        week_end = week_start + timedelta(days=7)
+        
+        for cal in principal.calendars():
+            cal_name = cal.get_display_name().strip()
+            try:
+                events = cal.search(start=week_start, end=week_end, event=True, expand=True)
+                for event in events:
+                    try:
+                        vevent = event.vobject_instance.vevent
+                        summary = str(vevent.summary.value) if hasattr(vevent, 'summary') else "?"
+                        uid = str(vevent.uid.value) if hasattr(vevent, 'uid') else ""
+                        dtstart = vevent.dtstart.value
+                        if hasattr(dtstart, 'hour'):
+                            time_str = dtstart.strftime("%H:%M")
+                            date_str = dtstart.strftime("%a %d.%m")
+                            sort_key = dtstart.isoformat()
+                        else:
+                            time_str = "весь день"
+                            date_str = dtstart.strftime("%a %d.%m")
+                            sort_key = dtstart.isoformat()
+                        results.append({
+                            "uid": uid,
+                            "title": summary,
+                            "time": time_str,
+                            "date": date_str,
+                            "calendar": cal_name,
+                            "sort_key": sort_key,
+                        })
+                    except Exception:
+                        continue
+            except Exception:
+                continue
+    except Exception as e:
+        logger.error("Week events error: %s", e)
+        reset_caldav_client()
+    # Sort by date/time
+    results.sort(key=lambda x: x.get("sort_key", ""))
+    return results
+
+
 def delete_all_test_events() -> int:
     """Delete all events created by the bot (with emoji prefixes)."""
     count = 0
@@ -845,6 +895,171 @@ class HealthHandler(BaseHTTPRequestHandler):
             self.send_header('Access-Control-Allow-Origin', '*')
             self.end_headers()
             self.wfile.write(json.dumps(data).encode())
+        elif self.path == '/weekly':
+            try:
+                events = get_week_events()
+                # Build HTML for iframe display
+                html = '''<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<style>
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #1a1c2e; color: #e0e0e0; margin: 0; padding: 8px; font-size: 13px; }
+.event { display: flex; padding: 4px 8px; border-bottom: 1px solid #2a2d42; align-items: center; }
+.event:last-child { border-bottom: none; }
+.date { color: #4ade80; font-weight: 600; min-width: 75px; font-size: 12px; }
+.time { color: #94a3b8; min-width: 50px; font-size: 12px; }
+.title { flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.cal { color: #64748b; font-size: 11px; margin-left: 8px; }
+.empty { text-align: center; padding: 20px; color: #64748b; }
+h3 { margin: 4px 8px 8px; color: #4ade80; font-size: 14px; border-bottom: 1px solid #4ade80; padding-bottom: 4px; }
+</style></head><body>
+<h3>\U0001f4c5 This Week</h3>\n'''
+                if events:
+                    for ev in events:
+                        title = ev['title'][:40]
+                        html += f'<div class="event"><span class="date">{ev["date"]}</span><span class="time">{ev["time"]}</span><span class="title">{title}</span><span class="cal">{ev["calendar"]}</span></div>\n'
+                else:
+                    html += '<div class="empty">No events this week</div>\n'
+                html += '</body></html>'
+                self.send_response(200)
+                self.send_header('Content-Type', 'text/html; charset=utf-8')
+                self.send_header('Access-Control-Allow-Origin', '*')
+                self.end_headers()
+                self.wfile.write(html.encode())
+            except Exception as e:
+                self.send_response(200)
+                self.send_header('Content-Type', 'text/html; charset=utf-8')
+                self.end_headers()
+                self.wfile.write(f'<html><body style="background:#1a1c2e;color:#e0e0e0;font-family:sans-serif;padding:20px">Error: {e}</body></html>'.encode())
+        elif self.path == '/repos':
+            try:
+                import urllib.request
+                req = urllib.request.Request(
+                    'https://api.github.com/users/sileade/repos?sort=updated&per_page=30',
+                    headers={'User-Agent': 'Nodkeys-Bot'}
+                )
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    repos = json.loads(resp.read().decode())
+                html = '''<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<style>
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #1a1c2e; color: #e0e0e0; margin: 0; padding: 8px; font-size: 13px; }
+.repo { display: flex; padding: 4px 8px; border-bottom: 1px solid #2a2d42; align-items: center; }
+.repo:last-child { border-bottom: none; }
+.repo a { color: #4ade80; text-decoration: none; font-weight: 600; flex: 1; }
+.repo a:hover { text-decoration: underline; }
+.desc { color: #94a3b8; font-size: 12px; margin-left: 8px; max-width: 200px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.meta { color: #64748b; font-size: 11px; min-width: 80px; text-align: right; }
+.lang { font-size: 11px; padding: 1px 6px; border-radius: 8px; background: #2a2d42; margin-left: 8px; }
+h3 { margin: 4px 8px 8px; color: #4ade80; font-size: 14px; border-bottom: 1px solid #4ade80; padding-bottom: 4px; }
+</style></head><body>
+<h3>\U0001f4e6 Repositories</h3>\n'''
+                for repo in repos:
+                    name = repo['name']
+                    url = repo['html_url']
+                    desc = (repo.get('description') or '')[:50]
+                    lang = repo.get('language') or ''
+                    updated = repo['updated_at'][:10]
+                    stars = repo.get('stargazers_count', 0)
+                    star_str = f'\u2b50{stars} ' if stars > 0 else ''
+                    lang_html = f'<span class="lang">{lang}</span>' if lang else ''
+                    html += f'<div class="repo"><a href="{url}" target="_blank">{name}</a>{lang_html}<span class="desc">{desc}</span><span class="meta">{star_str}{updated}</span></div>\n'
+                html += '</body></html>'
+                self.send_response(200)
+                self.send_header('Content-Type', 'text/html; charset=utf-8')
+                self.send_header('Access-Control-Allow-Origin', '*')
+                self.end_headers()
+                self.wfile.write(html.encode())
+            except Exception as e:
+                self.send_response(200)
+                self.send_header('Content-Type', 'text/html; charset=utf-8')
+                self.end_headers()
+                self.wfile.write(f'<html><body style="background:#1a1c2e;color:#e0e0e0;font-family:sans-serif;padding:20px">Error: {e}</body></html>'.encode())
+        elif self.path == '/kindle':
+            try:
+                from kindle_handler import get_book_history
+                books = get_book_history()
+                html = '''<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<meta http-equiv="refresh" content="60">
+<style>
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #1a1c2e; color: #e0e0e0; margin: 0; padding: 8px; font-size: 13px; }
+.book { display: flex; padding: 5px 8px; border-bottom: 1px solid #2a2d42; align-items: center; }
+.book:hover { background: #2a2d42; }
+.book:last-child { border-bottom: none; }
+.num { color: #64748b; min-width: 25px; font-size: 12px; }
+.title { color: #4ade80; font-weight: 600; flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.author { color: #94a3b8; font-size: 12px; margin-left: 8px; max-width: 120px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.format { font-size: 11px; padding: 1px 6px; border-radius: 8px; background: #2a2d42; margin-left: 8px; text-transform: uppercase; }
+.date { color: #64748b; font-size: 11px; min-width: 80px; text-align: right; margin-left: 8px; }
+.dl { color: #4ade80; text-decoration: none; font-size: 14px; margin-left: 8px; padding: 2px 6px; border-radius: 4px; }
+.dl:hover { background: #4ade80; color: #1a1c2e; }
+.empty { text-align: center; padding: 20px; color: #64748b; }
+h3 { margin: 4px 8px 8px; color: #4ade80; font-size: 14px; border-bottom: 1px solid #4ade80; padding-bottom: 4px; }
+.stats { display: flex; gap: 20px; padding: 4px 8px 8px; font-size: 12px; color: #94a3b8; }
+.stats span { color: #4ade80; font-weight: 600; }
+</style></head><body>
+<h3>\U0001f4da Kindle Library</h3>\n'''
+                html += f'<div class="stats">Total: <span>{len(books)}</span></div>\n'
+                if books:
+                    for i, book in enumerate(reversed(books), 1):
+                        title = book.get('title', 'Unknown')[:45]
+                        author = book.get('author', '')
+                        fmt = book.get('format_to', book.get('format_from', '?'))
+                        sent = book.get('sent_at', '')[:10]
+                        size = book.get('file_size_kb', 0)
+                        stored = book.get('stored_file', '')
+                        dl_btn = f'<a class="dl" href="/download/{stored}" title="Download" target="_blank">\u2b07</a>' if stored else ''
+                        html += f'<div class="book"><span class="num">{i}.</span><span class="title">{title}</span><span class="author">{author}</span><span class="format">{fmt}</span><span class="date">{sent}</span>{dl_btn}</div>\n'
+                else:
+                    html += '<div class="empty">No books sent yet. Send a file to @nodkeysbot!</div>\n'
+                html += '</body></html>'
+                self.send_response(200)
+                self.send_header('Content-Type', 'text/html; charset=utf-8')
+                self.send_header('Access-Control-Allow-Origin', '*')
+                self.end_headers()
+                self.wfile.write(html.encode())
+            except Exception as e:
+                self.send_response(200)
+                self.send_header('Content-Type', 'text/html; charset=utf-8')
+                self.end_headers()
+                self.wfile.write(f'<html><body style="background:#1a1c2e;color:#e0e0e0;font-family:sans-serif;padding:20px">Error: {e}</body></html>'.encode())
+        elif self.path.startswith('/download/'):
+            try:
+                from kindle_handler import BOOKS_STORAGE_DIR
+                filename = self.path[10:]  # Remove '/download/'
+                # Sanitize to prevent path traversal
+                filename = os.path.basename(filename)
+                file_path = os.path.join(BOOKS_STORAGE_DIR, filename)
+                if os.path.exists(file_path) and os.path.isfile(file_path):
+                    ext = os.path.splitext(filename)[1].lower()
+                    content_types = {
+                        '.pdf': 'application/pdf',
+                        '.epub': 'application/epub+zip',
+                        '.fb2': 'application/xml',
+                        '.mobi': 'application/x-mobipocket-ebook',
+                        '.txt': 'text/plain',
+                        '.doc': 'application/msword',
+                        '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+                    }
+                    ct = content_types.get(ext, 'application/octet-stream')
+                    self.send_response(200)
+                    self.send_header('Content-Type', ct)
+                    self.send_header('Content-Disposition', f'attachment; filename="{filename}"')
+                    self.send_header('Content-Length', str(os.path.getsize(file_path)))
+                    self.send_header('Access-Control-Allow-Origin', '*')
+                    self.end_headers()
+                    with open(file_path, 'rb') as f:
+                        self.wfile.write(f.read())
+                else:
+                    self.send_response(404)
+                    self.send_header('Content-Type', 'text/html; charset=utf-8')
+                    self.end_headers()
+                    self.wfile.write(b'<html><body style="background:#1a1c2e;color:#e0e0e0;font-family:sans-serif;padding:20px">File not found</body></html>')
+            except Exception as e:
+                self.send_response(500)
+                self.send_header('Content-Type', 'text/html; charset=utf-8')
+                self.end_headers()
+                self.wfile.write(f'<html><body style="background:#1a1c2e;color:#e0e0e0;font-family:sans-serif;padding:20px">Error: {e}</body></html>'.encode())
         elif self.path == '/books':
             try:
                 from kindle_handler import get_book_history
