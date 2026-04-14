@@ -21,6 +21,7 @@ import sys
 import json
 import logging
 import uuid
+import asyncio
 import traceback
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -508,15 +509,21 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+def _list_calendars() -> str:
+    """List available calendars (blocking)."""
+    client = get_caldav_client()
+    principal = client.principal()
+    cals = principal.calendars()
+    text = "\U0001f4c5 <b>Доступные календари:</b>\n\n"
+    for cal in cals:
+        name = cal.get_display_name().strip()
+        text += f"\u2022 {name}\n"
+    return text
+
+
 async def cmd_calendars(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        client = get_caldav_client()
-        principal = client.principal()
-        cals = principal.calendars()
-        text = "\U0001f4c5 <b>Доступные календари:</b>\n\n"
-        for cal in cals:
-            name = cal.get_display_name().strip()
-            text += f"\u2022 {name}\n"
+        text = await asyncio.to_thread(_list_calendars)
         await update.message.reply_text(text, parse_mode="HTML")
     except Exception as e:
         reset_caldav_client()
@@ -524,7 +531,7 @@ async def cmd_calendars(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    events = get_today_events()
+    events = await asyncio.to_thread(get_today_events)
     today = datetime.now(TIMEZONE).strftime("%d.%m.%Y")
     
     if not events:
@@ -556,7 +563,7 @@ async def cmd_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     thinking = await update.message.reply_text(f"\U0001f50d Ищу \u00ab{query}\u00bb...")
     
-    results = search_events_by_title(query)
+    results = await asyncio.to_thread(search_events_by_title, query)
     
     if not results:
         await thinking.edit_text(f"\u274c Не найдено записей по запросу \u00ab{query}\u00bb")
@@ -565,7 +572,7 @@ async def cmd_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(results) == 1:
         # Delete immediately
         ev = results[0]
-        success = delete_event_by_uid(ev["uid"])
+        success = await asyncio.to_thread(delete_event_by_uid, ev["uid"])
         if success:
             await thinking.edit_text(
                 f"\U0001f5d1 <b>Удалено:</b>\n"
@@ -594,7 +601,7 @@ async def cmd_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_cleanup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Delete all bot-created events."""
     thinking = await update.message.reply_text("\U0001f9f9 Удаляю все тестовые записи бота...")
-    count = delete_all_test_events()
+    count = await asyncio.to_thread(delete_all_test_events)
     await thinking.edit_text(
         f"\U0001f9f9 <b>Очистка завершена!</b>\n"
         f"Удалено записей: {count}",
@@ -613,7 +620,7 @@ async def callback_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     uid = data.replace("del:", "")
-    success = delete_event_by_uid(uid)
+    success = await asyncio.to_thread(delete_event_by_uid, uid)
     
     if success:
         await query.edit_message_text("\U0001f5d1 \u2705 Запись удалена!")
@@ -660,7 +667,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_id = msg.reply_to_message.message_id
             if reply_id in _event_store:
                 ev_data = _event_store[reply_id]
-                success = delete_event_by_uid(ev_data["uid"], ev_data.get("calendar"))
+                success = await asyncio.to_thread(delete_event_by_uid, ev_data["uid"], ev_data.get("calendar"))
                 if success:
                     await msg.reply_text("\U0001f5d1 \u2705 Запись удалена из календаря!")
                     del _event_store[reply_id]
@@ -702,7 +709,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "confidence": 1.0,
                 "reasoning": f"URL автоматически создан как задача на просмотр ({date_label})",
             }
-            uid = create_calendar_event(data)
+            uid = await asyncio.to_thread(create_calendar_event, data)
             if uid:
                 results.append((url, domain, uid, data))
         
@@ -741,16 +748,27 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     thinking_msg = await msg.reply_text("\U0001f914 Анализирую сообщение...")
 
-    # Analyze with Claude
-    data = analyze_message(full_text)
+    # Analyze with Claude (run in thread to avoid blocking event loop)
+    logger.info("Calling Claude API for analysis...")
+    try:
+        data = await asyncio.to_thread(analyze_message, full_text)
+    except Exception as e:
+        logger.error("analyze_message thread error: %s", e)
+        data = None
+    logger.info("Claude analysis result: %s", data is not None)
     if data is None:
         await thinking_msg.edit_text(
             "\u274c Не удалось проанализировать сообщение. Попробуйте ещё раз."
         )
         return
 
-    # Create calendar event
-    uid = create_calendar_event(data)
+    # Create calendar event (run in thread to avoid blocking event loop)
+    logger.info("Creating calendar event: %s", data.get('title', '?'))
+    try:
+        uid = await asyncio.to_thread(create_calendar_event, data)
+    except Exception as e:
+        logger.error("create_calendar_event thread error: %s", e)
+        uid = None
 
     if uid:
         type_map = {"event": "\U0001f4c5 Событие", "task": "\u2705 Задача", "reminder": "\U0001f514 Напоминание"}
@@ -824,8 +842,34 @@ class HealthHandler(BaseHTTPRequestHandler):
             }
             self.send_response(200)
             self.send_header('Content-Type', 'application/json')
+            self.send_header('Access-Control-Allow-Origin', '*')
             self.end_headers()
             self.wfile.write(json.dumps(data).encode())
+        elif self.path == '/books':
+            try:
+                from kindle_handler import get_book_history
+                books = get_book_history()
+                total = len(books)
+                last_book = books[-1]["title"] if books else "No books yet"
+                last_sent = books[-1]["sent_at"] if books else "-"
+                data = {
+                    "total_books": total,
+                    "last_book": last_book,
+                    "last_sent": last_sent,
+                    "books": books,
+                }
+            except Exception as e:
+                data = {
+                    "total_books": 0,
+                    "last_book": "No books yet",
+                    "last_sent": "-",
+                    "books": [],
+                }
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.end_headers()
+            self.wfile.write(json.dumps(data, ensure_ascii=False).encode())
         else:
             self.send_response(404)
             self.end_headers()

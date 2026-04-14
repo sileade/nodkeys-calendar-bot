@@ -30,8 +30,9 @@ KINDLE_EMAIL = os.getenv("KINDLE_EMAIL", "vera_muhamedova_abyH2D@kindle.com")
 KINDLE_DEVICES = os.getenv("KINDLE_DEVICES", "")  # "Name1:email1|Name2:email2"
 SMTP_HOST = os.getenv("KINDLE_SMTP_HOST", "smtp.mail.me.com")
 SMTP_PORT = int(os.getenv("KINDLE_SMTP_PORT", "587"))
-EMAIL_FROM = os.getenv("KINDLE_EMAIL_FROM", "home@sliadea.com")
+EMAIL_FROM = os.getenv("KINDLE_EMAIL_FROM", "slilea@icloud.com")
 EMAIL_PASSWORD = os.getenv("KINDLE_EMAIL_PASSWORD", "")
+SMTP_LOGIN = os.getenv("ICLOUD_USERNAME", EMAIL_FROM)  # Use iCloud username for SMTP auth
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 TMP_DIR = os.getenv("KINDLE_TMP_DIR", "/tmp/kindle_files")
 
@@ -58,6 +59,68 @@ DEFAULT_OUTPUT_FORMAT = "epub"
 
 # Stats
 _kindle_stats = {"sent": 0, "converted": 0, "errors": 0}
+
+# Books history - persistent list of all sent books
+BOOKS_DB_PATH = os.getenv("KINDLE_BOOKS_DB", "/app/data/kindle_books.json")
+_books_history = []
+
+
+def _load_books_history():
+    """Load books history from JSON file."""
+    global _books_history
+    try:
+        os.makedirs(os.path.dirname(BOOKS_DB_PATH), exist_ok=True)
+        if os.path.exists(BOOKS_DB_PATH):
+            with open(BOOKS_DB_PATH, 'r', encoding='utf-8') as f:
+                _books_history = json.load(f)
+    except Exception as e:
+        logger.error("Failed to load books history: %s", e)
+        _books_history = []
+
+
+def _save_books_history():
+    """Save books history to JSON file."""
+    try:
+        os.makedirs(os.path.dirname(BOOKS_DB_PATH), exist_ok=True)
+        with open(BOOKS_DB_PATH, 'w', encoding='utf-8') as f:
+            json.dump(_books_history, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.error("Failed to save books history: %s", e)
+
+
+def add_book_to_history(filename: str, title: str, author: str, 
+                        format_from: str, format_to: str,
+                        kindle_email: str, converted: bool, 
+                        file_size: int):
+    """Add a book entry to the history."""
+    from datetime import datetime
+    entry = {
+        "id": len(_books_history) + 1,
+        "filename": filename,
+        "title": title or os.path.splitext(filename)[0],
+        "author": author or "Unknown",
+        "format_from": format_from,
+        "format_to": format_to if converted else format_from,
+        "converted": converted,
+        "kindle_email": kindle_email,
+        "file_size_kb": round(file_size / 1024),
+        "sent_at": datetime.now().isoformat(),
+        "status": "sent"
+    }
+    _books_history.append(entry)
+    _save_books_history()
+    return entry
+
+
+def get_books_history() -> list:
+    """Return full books history."""
+    if not _books_history:
+        _load_books_history()
+    return _books_history
+
+
+# Load history on module import
+_load_books_history()
 
 
 def get_kindle_devices() -> list:
@@ -249,7 +312,7 @@ def send_email_to_kindle(
             server.ehlo()
             server.starttls()
             server.ehlo()
-            server.login(EMAIL_FROM, EMAIL_PASSWORD)
+            server.login(SMTP_LOGIN, EMAIL_PASSWORD)
             server.sendmail(EMAIL_FROM, kindle_email, msg.as_string())
 
         _kindle_stats["sent"] += 1
@@ -468,6 +531,18 @@ async def callback_kindle(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 result_text += f"🔄 <b>Конвертировано:</b> {file_info['file_ext'].upper()} → {file_info['recommended_output'].upper()}\n"
             result_text += f"\n📬 <i>Книга появится на Kindle через 1-5 минут</i>"
 
+            # Track in books history
+            add_book_to_history(
+                filename=file_info['filename'],
+                title=title,
+                author=author,
+                format_from=file_info['file_ext'].upper(),
+                format_to=file_info.get('recommended_output', '').upper() if converted else file_info['file_ext'].upper(),
+                kindle_email=kindle_email,
+                converted=converted,
+                file_size=file_info['file_size'],
+            )
+
             await query.edit_message_text(result_text, parse_mode="HTML")
         else:
             await query.edit_message_text(
@@ -502,3 +577,9 @@ def get_kindle_stats() -> dict:
         "kindle_converted": _kindle_stats["converted"],
         "kindle_errors": _kindle_stats["errors"],
     }
+
+
+def get_book_history() -> list:
+    """Return the full list of books sent to Kindle."""
+    _load_books_history()
+    return _books_history
