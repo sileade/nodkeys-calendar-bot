@@ -23,6 +23,7 @@ import imaplib
 import time as _time
 import xml.etree.ElementTree as ET
 from http.server import HTTPServer, BaseHTTPRequestHandler
+import socketserver
 from datetime import datetime, timedelta, date
 from zoneinfo import ZoneInfo
 from urllib.parse import urlparse, quote
@@ -47,6 +48,12 @@ CHAT_ID = int(os.environ.get("TELEGRAM_CHAT_ID", "0"))
 CLAUDE_API_KEY = os.environ.get("CLAUDE_API_KEY", "")
 CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-20250514")
 
+# SOCKS5 proxy for Telegram API (e.g., ss-proxy:1080 in Docker network)
+TELEGRAM_PROXY_URL = os.environ.get("TELEGRAM_PROXY_URL", "")  # socks5://ss-proxy:1080
+CLAUDE_PROXY_URL = os.environ.get("CLAUDE_PROXY_URL", "")  # socks5://ss-proxy:1080
+# Custom Telegram API base URL (to bypass DNS-level blocks)
+TELEGRAM_BASE_URL = os.environ.get("TELEGRAM_BASE_URL", "")  # https://149.154.167.220/bot
+
 ICLOUD_USERNAME = os.environ.get("ICLOUD_USERNAME", "")
 ICLOUD_PASSWORD = os.environ.get("ICLOUD_PASSWORD", "")
 CALDAV_URL = os.environ.get("CALDAV_URL", "https://caldav.icloud.com/")
@@ -68,6 +75,7 @@ NOTES_FOLDER = "Notes"
 FLIBUSTA_BASE_URL = os.environ.get("FLIBUSTA_BASE_URL", "https://flibusta.is")
 FLIBUSTA_OPDS_SEARCH = "/opds/opensearch"
 FLIBUSTA_TIMEOUT = 15
+FLIBUSTA_PROXY_URL = os.environ.get("FLIBUSTA_PROXY_URL", "socks5://ss-proxy:1080")
 
 # MIME type to format mapping
 MIME_TO_FORMAT = {
@@ -80,12 +88,34 @@ MIME_TO_FORMAT = {
     "application/html+zip": "html",
 }
 
+# ──────────────────── Flibusta HTTP Client ────────────────────
+import httpx as _flib_httpx
+if FLIBUSTA_PROXY_URL:
+    _flib_client = _flib_httpx.Client(
+        proxy=FLIBUSTA_PROXY_URL,
+        timeout=FLIBUSTA_TIMEOUT,
+        verify=False,
+        follow_redirects=True,
+        headers={"User-Agent": "NodkeysBot/4.1", "Accept": "application/atom+xml"},
+    )
+    logger_init_msg = f"Flibusta using proxy: {FLIBUSTA_PROXY_URL}"
+else:
+    _flib_client = _flib_httpx.Client(
+        timeout=FLIBUSTA_TIMEOUT,
+        verify=False,
+        follow_redirects=True,
+        headers={"User-Agent": "NodkeysBot/4.1", "Accept": "application/atom+xml"},
+    )
+    logger_init_msg = "Flibusta direct (no proxy)"
+
 # ──────────────────── Logging ────────────────────
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     level=logging.INFO,
 )
 logger = logging.getLogger("calendar-bot")
+
+logger.info(logger_init_msg)
 
 # ──────────────────── URL Detection ────────────────────
 URL_REGEX = re.compile(
@@ -275,7 +305,12 @@ def create_diary_entry(text: str) -> bool:
 # ══════════════════════════════════════════════════════════
 
 def search_flibusta(query: str, limit: int = 10) -> list[dict]:
-    """Search books on Flibusta via OPDS catalog.
+    """Search books on Flibusta via HTML web search + OPDS catalog.
+    
+    Strategy:
+    1. Try HTML web search first (finds more books, including classics)
+    2. If HTML fails, try OPDS search
+    3. If both fail and query has multiple words, retry with shorter query
     
     Args:
         query: Search query string
@@ -283,6 +318,26 @@ def search_flibusta(query: str, limit: int = 10) -> list[dict]:
     Returns:
         List of book dicts with keys: id, title, authors, formats, language, genre
     """
+    # First try HTML web search (more comprehensive, finds classics like Tolstoy)
+    results = _search_flibusta_web(query, limit)
+    
+    # If web search returned nothing, try OPDS
+    if not results:
+        logger.info("Web search returned 0 results for '%s', trying OPDS", query)
+        results = _search_flibusta_opds(query, limit)
+    
+    # If still nothing and query has multiple words, retry with shorter query
+    if not results and ' ' in query:
+        short_query = ' '.join(query.split()[:-1])
+        if short_query:
+            logger.info("Flibusta retry with shorter query: '%s'", short_query)
+            return search_flibusta(short_query, limit)
+    
+    return results
+
+
+def _search_flibusta_opds(query: str, limit: int = 10) -> list[dict]:
+    """Search books on Flibusta via OPDS catalog."""
     results = []
     page = 0
     
@@ -294,15 +349,11 @@ def search_flibusta(query: str, limit: int = 10) -> list[dict]:
             )
             logger.info("Flibusta OPDS search: %s", url)
             
-            req = Request(url)
-            req.add_header('Accept', 'application/atom+xml')
-            req.add_header('User-Agent', 'NodkeysBot/4.0')
-            
-            with urlopen(req, timeout=FLIBUSTA_TIMEOUT) as resp:
-                xml_data = resp.read()
+            resp = _flib_client.get(url)
+            resp.raise_for_status()
+            xml_data = resp.content
             
             root = ET.fromstring(xml_data)
-            # OPDS uses Atom namespace
             ns = {
                 'atom': 'http://www.w3.org/2005/Atom',
                 'dc': 'http://purl.org/dc/terms/',
@@ -311,7 +362,6 @@ def search_flibusta(query: str, limit: int = 10) -> list[dict]:
             
             entries = root.findall('atom:entry', ns)
             if not entries:
-                # Try without namespace (some servers don't use it)
                 entries = root.findall('{http://www.w3.org/2005/Atom}entry')
             if not entries:
                 entries = root.findall('entry')
@@ -322,12 +372,10 @@ def search_flibusta(query: str, limit: int = 10) -> list[dict]:
             for entry in entries:
                 if len(results) >= limit:
                     break
-                
                 book = _parse_opds_entry(entry, ns)
                 if book and book.get('id'):
                     results.append(book)
             
-            # Check for "next" pagination link
             has_next = False
             for link in root.findall('atom:link', ns) + root.findall('{http://www.w3.org/2005/Atom}link') + root.findall('link'):
                 if link.get('rel') == 'next':
@@ -338,8 +386,8 @@ def search_flibusta(query: str, limit: int = 10) -> list[dict]:
                 break
             page += 1
             
-        except (URLError, HTTPError) as e:
-            logger.error("Flibusta search error: %s", e)
+        except _flib_httpx.HTTPStatusError as e:
+            logger.error("Flibusta HTTP error: %s", e)
             break
         except ET.ParseError as e:
             logger.error("Flibusta XML parse error: %s", e)
@@ -348,7 +396,86 @@ def search_flibusta(query: str, limit: int = 10) -> list[dict]:
             logger.error("Flibusta unexpected error: %s", e)
             break
     
-    logger.info("Flibusta search '%s': found %d results", query, len(results))
+    logger.info("Flibusta OPDS search '%s': found %d results", query, len(results))
+    return results
+
+
+def _search_flibusta_web(query: str, limit: int = 10) -> list[dict]:
+    """Search books on Flibusta via HTML web search (more comprehensive than OPDS)."""
+    results = []
+    try:
+        url = f"{FLIBUSTA_BASE_URL}/booksearch?ask={quote(query)}&t=0"
+        logger.info("Flibusta web search: %s", url)
+        resp = _flib_client.get(url)
+        if resp.status_code != 200:
+            logger.warning("Flibusta web search returned %d", resp.status_code)
+            return results
+        
+        html = resp.text
+        # Find the books section - try multiple markers
+        books_idx = -1
+        for marker in ['Найденные книги', 'Найденных книг', 'найденные книги']:
+            books_idx = html.find(marker)
+            if books_idx >= 0:
+                break
+        
+        if books_idx < 0:
+            # Also try to find any <li> with /b/ links after the search form
+            form_idx = html.find('</form>')
+            if form_idx >= 0 and '/b/' in html[form_idx:]:
+                books_idx = form_idx
+                logger.info("Flibusta web search: found book links after form")
+            else:
+                logger.info("Flibusta web search: no books section found for '%s'", query)
+                return results
+        
+        books_html = html[books_idx:]
+        
+        # Parse book entries: <li><a href="/b/BOOK_ID">Title</a> - <a href="/a/AUTHOR_ID">Author</a></li>
+        # Titles may contain <span> tags for highlighting
+        import re
+        # Extract each <li> block
+        li_pattern = re.compile(r'<li>(.*?)</li>', re.DOTALL)
+        book_id_pattern = re.compile(r'href="/b/(\d+)"')
+        author_pattern = re.compile(r'href="/a/\d+">([^<]+)</a>')
+        
+        for li_match in li_pattern.finditer(books_html):
+            if len(results) >= limit:
+                break
+            
+            li_html = li_match.group(1)
+            
+            # Extract book ID
+            bid_match = book_id_pattern.search(li_html)
+            if not bid_match:
+                continue
+            book_id = int(bid_match.group(1))
+            
+            # Extract title: text of the first <a href="/b/..."> link (strip HTML tags)
+            title_pattern = re.compile(r'<a href="/b/\d+"[^>]*>(.*?)</a>', re.DOTALL)
+            title_match = title_pattern.search(li_html)
+            if not title_match:
+                continue
+            title = re.sub(r'<[^>]+>', '', title_match.group(1)).strip()
+            
+            # Extract authors
+            authors = author_pattern.findall(li_html)
+            
+            # Standard formats for Flibusta books
+            formats = ["epub", "fb2", "mobi"]
+            
+            results.append({
+                "id": book_id,
+                "title": title,
+                "authors": authors,
+                "formats": formats,
+                "language": "ru",
+                "genre": "",
+            })
+        
+        logger.info("Flibusta web search '%s': found %d results", query, len(results))
+    except Exception as e:
+        logger.error("Flibusta web search error: %s", e)
     return results
 
 
@@ -433,8 +560,70 @@ def _parse_opds_entry(entry, ns: dict) -> dict | None:
     return book
 
 
+# ──────────────────── ANNA'S ARCHIVE FALLBACK ────────────────────
+ANNAS_ARCHIVE_URL = "https://annas-archive.org"
+
+def search_annas_archive(query: str, limit: int = 10) -> list[dict]:
+    """Резервный поиск через Anna's Archive."""
+    results = []
+    try:
+        url = f"{ANNAS_ARCHIVE_URL}/search?q={quote(query)}&content=book_fiction&content=book_nonfiction&lang=ru&lang=en"
+        resp = _flib_client.get(url, headers={
+            "User-Agent": "Mozilla/5.0",
+            "Accept": "text/html",
+        })
+        if resp.status_code != 200:
+            logger.warning("Anna's Archive returned %d", resp.status_code)
+            return results
+
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(resp.text, "html.parser")
+        for item in soup.select("a[href*='/md5/']")[:limit]:
+            title_el = item.select_one("h3")
+            author_el = item.select_one("div.italic")
+            if title_el:
+                results.append({
+                    "title": title_el.get_text(strip=True),
+                    "author": author_el.get_text(strip=True) if author_el else "Unknown",
+                    "url": ANNAS_ARCHIVE_URL + item["href"],
+                    "source": "annas_archive",
+                })
+    except Exception as e:
+        logger.error("Anna's Archive search error: %s", e)
+    return results
+
+
+# ──────────────────── JACKETT BOOK SEARCH ────────────────────
+JACKETT_URL = "http://jackett:9117"
+JACKETT_API_KEY = os.environ.get("JACKETT_API_KEY", "zudqeyrvgh880mqr2a9i68o5cb2r0gie")
+
+def search_jackett_books(query: str, limit: int = 5) -> list[dict]:
+    """Поиск книг через Jackett (RuTracker, RuTor и др.)."""
+    results = []
+    try:
+        import httpx
+        resp = httpx.get(
+            f"{JACKETT_URL}/api/v2.0/indexers/all/results",
+            params={"apikey": JACKETT_API_KEY, "Query": query, "Category[]": "7000"},
+            timeout=15,
+        )
+        if resp.status_code == 200:
+            for item in resp.json().get("Results", [])[:limit]:
+                results.append({
+                    "title": item.get("Title", ""),
+                    "author": "",
+                    "url": item.get("Details", ""),
+                    "magnet": item.get("MagnetUri", ""),
+                    "size": item.get("Size", 0),
+                    "source": "jackett",
+                })
+    except Exception as e:
+        logger.error("Jackett search error: %s", e)
+    return results
+
+
 def download_book(book_id: int, fmt: str = "epub") -> tuple[bytes | None, str]:
-    """Download a book from Flibusta.
+    """Download a book from Flibusta (using httpx + proxy).
     
     Args:
         book_id: Flibusta book ID
@@ -446,17 +635,25 @@ def download_book(book_id: int, fmt: str = "epub") -> tuple[bytes | None, str]:
         url = f"{FLIBUSTA_BASE_URL}/b/{book_id}/{fmt}"
         logger.info("Downloading book: %s", url)
         
-        req = Request(url)
-        req.add_header('User-Agent', 'NodkeysBot/4.0')
+        # Use a longer timeout for downloads
+        download_client = _flib_httpx.Client(
+            proxy=FLIBUSTA_PROXY_URL if FLIBUSTA_PROXY_URL else None,
+            timeout=60,
+            verify=False,
+            follow_redirects=True,
+            headers={"User-Agent": "NodkeysBot/4.1"},
+        )
         
-        with urlopen(req, timeout=60) as resp:
-            data = resp.read()
+        try:
+            resp = download_client.get(url)
+            resp.raise_for_status()
+            data = resp.content
             
             # Try to get filename from Content-Disposition
             cd = resp.headers.get('Content-Disposition', '')
             filename = ""
             if cd:
-                fn_match = re.search(r'filename\*?=(?:UTF-8\'\'|"?)([^";]+)"?', cd)
+                fn_match = re.search(r'filename\*?=(?:UTF-8\'\'\'|"?)([^";]+)"?', cd)
                 if fn_match:
                     from urllib.parse import unquote
                     filename = unquote(fn_match.group(1))
@@ -469,6 +666,8 @@ def download_book(book_id: int, fmt: str = "epub") -> tuple[bytes | None, str]:
             
             logger.info("Downloaded %d bytes: %s", len(data), filename)
             return data, filename
+        finally:
+            download_client.close()
     
     except Exception as e:
         logger.error("Book download error: %s", e)
@@ -479,7 +678,57 @@ def download_book(book_id: int, fmt: str = "epub") -> tuple[bytes | None, str]:
 # ██  CLAUDE AI
 # ══════════════════════════════════════════════════════════
 
-claude_client = anthropic.Anthropic(api_key=CLAUDE_API_KEY)
+# Use SOCKS5 proxy for Claude API if configured
+if CLAUDE_PROXY_URL:
+    import httpx as _httpx
+    _claude_http_client = _httpx.Client(proxy=CLAUDE_PROXY_URL)
+    claude_client = anthropic.Anthropic(api_key=CLAUDE_API_KEY, http_client=_claude_http_client)
+    logger.info("Claude API using proxy: %s", CLAUDE_PROXY_URL)
+else:
+    claude_client = anthropic.Anthropic(api_key=CLAUDE_API_KEY)
+
+def _ai_rethink_book_query(query: str, author: str | None = None) -> list[str]:
+    """Ask Claude for alternative book names when search fails.
+    Returns a list of alternative search queries."""
+    author_hint = f" автора {author}" if author else ""
+    rethink_prompt = f"""Книга \"{query}\"{author_hint} не найдена на Flibusta по прямому поиску.
+
+Подумай: какие АЛЬТЕРНАТИВНЫЕ НАЗВАНИЯ может иметь эта книга?
+Учти:
+1. Разные варианты перевода названия на русский
+2. Оригинальное название на языке автора
+3. Сокращённые или народные названия
+4. Фамилию автора (полную, на русском)
+5. Если пользователь мог ошибиться в названии — предложи правильное
+
+Примеры:
+- "Странник среди звёзд" Джека Лондона → ["Межзвёздный скиталец", "Межзвёздный скиталец Лондон", "The Star Rover", "Звёздный скиталец"]
+- "Над пропастью во ржи" → ["Ловец во ржи", "The Catcher in the Rye", "Сэлинджер"]
+- "Маленький принц" → ["Le Petit Prince", "Маленький принц Экзюпери"]
+- "451 по Фаренгейту" → ["451 градус по Фаренгейту", "Fahrenheit 451", "Брэдбери 451"]
+
+Ответь ТОЛЬКО JSON-массивом строк (до 6 вариантов), от наиболее вероятного к менее.
+Пример: ["Межзвёздный скиталец", "Межзвёздный скиталец Лондон", "The Star Rover"]"""
+
+    try:
+        response = claude_client.messages.create(
+            model=CLAUDE_MODEL,
+            max_tokens=256,
+            messages=[{"role": "user", "content": rethink_prompt}],
+        )
+        raw = response.content[0].text.strip()
+        # Strip markdown code fences if present
+        if raw.startswith("```"):
+            raw = raw.split("\n", 1)[1]
+            if raw.endswith("```"):
+                raw = raw[:-3].strip()
+        result = json.loads(raw)
+        if isinstance(result, list):
+            return [str(q) for q in result[:6]]
+    except Exception as e:
+        logger.error("AI rethink error: %s", e)
+    return []
+
 
 SYSTEM_PROMPT = """Ты — умный ассистент-планировщик. Тебе пересылают сообщения из Telegram.
 Твоя задача — проанализировать текст и определить, содержит ли он информацию для создания записи.
@@ -531,8 +780,14 @@ SYSTEM_PROMPT = """Ты — умный ассистент-планировщик
    - `content` — текст дневниковой записи (будет добавлен в дневник дня с таймстампом)
 
 ### Для book_search (поиск книги):
-   - `query` — поисковый запрос: название книги и/или автор (извлеки из сообщения)
+   - `query` — ПОЛНОЕ название книги как указал пользователь (не сокращай, не обрезай!)
+   - `author` — автор книги, если указан или очевиден из контекста (null если не указан)
+   - `search_queries` — массив из 2-3 поисковых запросов для поиска, от точного к общему:
+     1. Полное название + автор (если известен)
+     2. Только полное название книги
+     3. Ключевые слова из названия (если название длинное)
    - `title` — краткое описание что ищем (для отображения пользователю)
+   - `send_to_kindle` — true если пользователь явно просит отправить на Kindle/читалку
 
 Текущая дата и время: {current_datetime}
 День недели: {weekday}
@@ -604,11 +859,30 @@ SYSTEM_PROMPT = """Ты — умный ассистент-планировщик
 {{
   "action": "create",
   "type": "book_search",
-  "query": "Мастер и Маргарита Булгаков",
-  "title": "Поиск: Мастер и Маргарита",
-  "confidence": 0.9,
-  "reasoning": "Анализ"
+  "query": "Странник среди звёзд",
+  "author": "Хайнлайн",
+  "search_queries": ["Странник среди звёзд Хайнлайн", "Странник среди звёзд", "странник звёзд"],
+  "send_to_kindle": true,
+  "title": "Поиск: Странник среди звёзд",
+  "confidence": 0.95,
+  "reasoning": "Пользователь просит отправить на Kindle книгу 'Странник среди звёзд'. Автор — Роберт Хайнлайн (классика НФ)."
 }}
+
+Примеры анализа book_search:
+- "Отправь на киндл войну и мир" → query: "Война и мир", author: "Толстой", search_queries: ["Война и мир Толстой", "Война и мир"]
+- "Скачай книгу странник среди звезд" → query: "Странник среди звёзд", author: "Хайнлайн", search_queries: ["Странник среди звёзд", "Stranger star"]
+- "Найди 1984" → query: "1984", author: "Оруэлл", search_queries: ["1984 Оруэлл", "1984"]
+- "Хочу почитать что-нибудь Стругацких" → query: "Стругацкие", author: "Стругацкие", search_queries: ["Стругацкие", "Аркадий Борис Стругацкие"]
+
+ВАЖНО для book_search:
+- ВСЕГДА извлекай ПОЛНОЕ название книги, не обрезай слова
+- Если автор очевиден из контекста (классика, известные книги) — ОБЯЗАТЕЛЬНО укажи его
+- search_queries должны идти от точного к общему
+- Используй свои знания о литературе для определения автора
+- Если книга может иметь АЛЬТЕРНАТИВНЫЕ НАЗВАНИЯ (переводы, варианты) — ОБЯЗАТЕЛЬНО добавь их в search_queries
+  Примеры: "Странник среди звёзд" Джека Лондона → на русском также "Межзвёздный скиталец", оригинал "The Star Rover"
+  "Над пропастью во ржи" → "The Catcher in the Rye"
+  "Маленький принц" → "Le Petit Prince"
 
 ВАЖНО: Всегда отвечай ТОЛЬКО валидным JSON без markdown-обёртки."""
 
@@ -702,7 +976,8 @@ def get_caldav_client() -> caldav.DAVClient:
     global _caldav_client
     if _caldav_client is None:
         _caldav_client = caldav.DAVClient(
-            url=CALDAV_URL, username=ICLOUD_USERNAME, password=ICLOUD_PASSWORD
+            url=CALDAV_URL, username=ICLOUD_USERNAME, password=ICLOUD_PASSWORD,
+            timeout=30
         )
     return _caldav_client
 
@@ -1219,6 +1494,15 @@ async def cmd_book(update: Update, context: ContextTypes.DEFAULT_TYPE):
         results = []
     
     if not results:
+        logger.info("Flibusta returned 0 results, trying Anna's Archive")
+        try:
+            await thinking.edit_text(f"🔍 Ищу «{query}» в Anna's Archive...")
+            results = await asyncio.to_thread(search_annas_archive, query)
+        except Exception as e:
+            logger.error("Anna's Archive search error: %s", e)
+            results = []
+    
+    if not results:
         await thinking.edit_text(
             f"❌ По запросу «{query}» ничего не найдено.\n\n"
             f"💡 Попробуйте другой запрос или проверьте написание.",
@@ -1383,23 +1667,104 @@ async def callback_book(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             logger.error("Conversion error: %s", e)
     
-    # Send to Kindle
+    # Show device selection
+    try:
+        from kindle_handler import get_kindle_devices
+        devices = get_kindle_devices()
+    except ImportError:
+        devices = [("Kindle", os.getenv("KINDLE_EMAIL", ""))]
+    
+    # Store book info for the device selection callback
+    context.user_data["book_kindle_pending"] = {
+        "send_path": send_path,
+        "book_title": book['title'],
+        "authors_str": authors_str,
+        "book_fmt": book_fmt,
+        "converted": converted,
+    }
+    
+    # Always show device selection buttons
+    keyboard = []
+    for name, email in devices:
+        keyboard.append([InlineKeyboardButton(
+            f"📱 {name}",
+            callback_data=f"bookdev:{email}"
+        )])
+    keyboard.append([InlineKeyboardButton("❌ Отмена", callback_data="bookdev:cancel")])
+    
+    fmt_str = book_fmt.upper()
+    if converted:
+        fmt_str += " → EPUB"
+    
     await query.edit_message_text(
-        f"📧 Отправляю на Kindle...\n\n"
         f"📖 <b>{book['title']}</b>\n"
+        f"✍️ {authors_str}\n"
+        f"📄 Формат: {fmt_str}\n\n"
+        f"📱 <b>Отправить на:</b>",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+
+async def callback_bookdev(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle Kindle device selection for book search results."""
+    query = update.callback_query
+    await query.answer()
+    
+    data = query.data
+    if not data.startswith("bookdev:"):
+        return
+    
+    kindle_email = data[8:]  # Remove "bookdev:" prefix
+    
+    if kindle_email == "cancel":
+        await query.edit_message_text("❌ Отправка отменена.")
+        context.user_data.pop("book_kindle_pending", None)
+        context.user_data.pop("book_search_results", None)
+        return
+    
+    await _send_book_to_kindle_device(query, context, kindle_email)
+
+
+async def _send_book_to_kindle_device(query, context, kindle_email: str):
+    """Send the pending book to the specified Kindle device."""
+    pending = context.user_data.get("book_kindle_pending")
+    if not pending:
+        await query.edit_message_text("⚠️ Данные книги не найдены. Попробуйте заново.")
+        return
+    
+    send_path = pending["send_path"]
+    book_title = pending["book_title"]
+    authors_str = pending["authors_str"]
+    book_fmt = pending["book_fmt"]
+    converted = pending["converted"]
+    
+    # Find device name
+    device_name = kindle_email
+    try:
+        from kindle_handler import get_kindle_devices
+        for name, email in get_kindle_devices():
+            if email == kindle_email:
+                device_name = name
+                break
+    except ImportError:
+        pass
+    
+    await query.edit_message_text(
+        f"📧 Отправляю на {device_name}...\n\n"
+        f"📖 <b>{book_title}</b>\n"
         f"✍️ {authors_str}",
         parse_mode="HTML",
     )
     
     try:
-        from kindle_handler import send_email_to_kindle, add_book_to_history, store_book_file, KINDLE_EMAIL
+        from kindle_handler import send_email_to_kindle, add_book_to_history, store_book_file
         
-        subject = f"{book['title']} - {authors_str}"
-        success, error_msg = send_email_to_kindle(send_path, KINDLE_EMAIL, subject)
+        subject = f"{book_title} - {authors_str}"
+        success, error_msg = send_email_to_kindle(send_path, kindle_email, subject)
         
         if success:
             # Store book permanently
-            book_id_num = len(add_book_to_history.__defaults__ or []) + 1
             try:
                 from kindle_handler import get_books_history
                 book_id_num = len(get_books_history()) + 1
@@ -1410,49 +1775,39 @@ async def callback_book(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
             add_book_to_history(
                 filename=os.path.basename(send_path),
-                title=book['title'],
+                title=book_title,
                 author=authors_str,
                 format_from=book_fmt.upper(),
                 format_to="EPUB" if converted else book_fmt.upper(),
-                kindle_email=KINDLE_EMAIL,
+                kindle_email=kindle_email,
                 converted=converted,
                 file_size=os.path.getsize(send_path),
                 stored_file=stored_file,
             )
             
+            from pathlib import Path as _Path
             result_text = (
-                f"✅ <b>Книга отправлена на Kindle!</b>\n\n"
-                f"📖 <b>{book['title']}</b>\n"
+                f"✅ <b>Книга отправлена на {device_name}!</b>\n\n"
+                f"📖 <b>{book_title}</b>\n"
                 f"✍️ {authors_str}\n"
-                f"📄 Формат: {Path(send_path).suffix.upper()}\n"
+                f"📄 Формат: {_Path(send_path).suffix.upper()}\n"
             )
             if converted:
                 result_text += f"🔄 Конвертировано: {book_fmt.upper()} → EPUB\n"
-            result_text += f"\n📬 <i>Книга появится на Kindle через 1-5 минут</i>"
+            result_text += f"\n📬 <i>Книга появится на {device_name} через 1-5 минут</i>"
             
             await query.edit_message_text(result_text, parse_mode="HTML")
         else:
             await query.edit_message_text(
-                f"❌ <b>Ошибка отправки на Kindle</b>\n\n{error_msg}",
+                f"❌ <b>Ошибка отправки на {device_name}</b>\n\n{error_msg}",
                 parse_mode="HTML",
             )
     except ImportError:
-        # Kindle handler not available — send as Telegram document
         await query.edit_message_text(
-            f"📖 <b>{book['title']}</b>\n\n"
-            f"⚠️ Kindle handler недоступен. Отправляю файл в чат.",
+            f"📖 <b>{book_title}</b>\n\n"
+            f"⚠️ Kindle handler недоступен.",
             parse_mode="HTML",
         )
-        try:
-            with open(send_path, 'rb') as f:
-                await context.bot.send_document(
-                    chat_id=query.message.chat_id,
-                    document=f,
-                    filename=os.path.basename(send_path),
-                    caption=f"📖 {book['title']} — {authors_str}",
-                )
-        except Exception as e:
-            logger.error("Send document error: %s", e)
     except Exception as e:
         logger.error("Kindle send error: %s", e)
         await query.edit_message_text(
@@ -1461,6 +1816,7 @@ async def callback_book(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     
     # Cleanup temp files
+    tmp_dir = "/tmp/kindle_files"
     try:
         for f in os.listdir(tmp_dir):
             fp = os.path.join(tmp_dir, f)
@@ -1469,6 +1825,7 @@ async def callback_book(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         pass
     
+    context.user_data.pop("book_kindle_pending", None)
     context.user_data.pop("book_search_results", None)
 
 
@@ -1683,24 +2040,145 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     elif entry_type == "book_search":
-        # Search for books on Flibusta
+        # Search for books — use search_queries from Claude for multi-query search
         search_query = data.get("query", text)
+        search_author = data.get("author")  # May be None
+        search_queries = data.get("search_queries", [search_query])
+        send_to_kindle = data.get("send_to_kindle", False)
         search_title = data.get("title", f"\u041f\u043e\u0438\u0441\u043a: {search_query}")
         
-        await thinking_msg.edit_text(f"\U0001f50d \u0418\u0449\u0443 \u00ab{search_query}\u00bb \u043d\u0430 \u0424\u043b\u0438\u0431\u0443\u0441\u0442\u0435...")
+        logger.info("Book search: query='%s', author='%s', queries=%s, kindle=%s",
+                    search_query, search_author, search_queries, send_to_kindle)
         
-        try:
-            results = await asyncio.to_thread(search_flibusta, search_query, 8)
-        except Exception as e:
-            logger.error("Book search thread error: %s", e)
-            results = []
+        # Try each search query until we get results
+        all_results = []
+        for sq in search_queries:
+            await thinking_msg.edit_text(f"\U0001f50d \u0418\u0449\u0443 \u00ab{sq}\u00bb \u043d\u0430 \u0424\u043b\u0438\u0431\u0443\u0441\u0442\u0435...")
+            try:
+                results = await asyncio.to_thread(search_flibusta, sq, 10)
+                if results:
+                    all_results.extend(results)
+                    logger.info("Flibusta found %d results for '%s'", len(results), sq)
+                    break  # Got results, stop trying
+            except Exception as e:
+                logger.error("Book search error for '%s': %s", sq, e)
         
-        if not results:
+        # Fallback to Anna's Archive / Jackett if nothing found
+        if not all_results:
+            for sq in search_queries[:2]:
+                try:
+                    await thinking_msg.edit_text(f"\U0001f50d \u0418\u0449\u0443 \u00ab{sq}\u00bb \u0432 Anna's Archive...")
+                    results = await asyncio.to_thread(search_annas_archive, sq)
+                    if results:
+                        all_results.extend(results)
+                        break
+                except Exception as e:
+                    logger.error("Anna's Archive error: %s", e)
+        
+        if not all_results:
+            for sq in search_queries[:2]:
+                try:
+                    await thinking_msg.edit_text(f"\U0001f50d \u0418\u0449\u0443 \u00ab{sq}\u00bb \u0447\u0435\u0440\u0435\u0437 Jackett...")
+                    results = await asyncio.to_thread(search_jackett_books, sq)
+                    if results:
+                        all_results.extend(results)
+                        break
+                except Exception as e:
+                    logger.error("Jackett error: %s", e)
+        
+        # AI RETHINK: if no results or results seem irrelevant, ask Claude for alternative names
+        needs_rethink = False
+        if not all_results:
+            needs_rethink = True
+        elif search_author:
+            # Check if any result matches the expected author
+            author_lower = search_author.lower()
+            has_author_match = any(
+                author_lower in " ".join(b.get("authors", [])).lower()
+                for b in all_results
+            )
+            if not has_author_match:
+                needs_rethink = True
+                logger.info("No results match author '%s', triggering AI rethink", search_author)
+        
+        if needs_rethink:
+            await thinking_msg.edit_text(f"\U0001f9e0 \u0418\u0449\u0443 \u0430\u043b\u044c\u0442\u0435\u0440\u043d\u0430\u0442\u0438\u0432\u043d\u044b\u0435 \u043d\u0430\u0437\u0432\u0430\u043d\u0438\u044f \u00ab{search_query}\u00bb...")
+            try:
+                alt_queries = await asyncio.to_thread(_ai_rethink_book_query, search_query, search_author)
+                if alt_queries:
+                    logger.info("AI rethink suggested: %s", alt_queries)
+                    for aq in alt_queries:
+                        await thinking_msg.edit_text(f"\U0001f50d \u0418\u0449\u0443 \u00ab{aq}\u00bb \u043d\u0430 \u0424\u043b\u0438\u0431\u0443\u0441\u0442\u0435...")
+                        try:
+                            results = await asyncio.to_thread(search_flibusta, aq, 10)
+                            if results:
+                                all_results.extend(results)
+                                logger.info("AI rethink: found %d results for '%s'", len(results), aq)
+                                break
+                        except Exception as e:
+                            logger.error("AI rethink search error: %s", e)
+            except Exception as e:
+                logger.error("AI rethink error: %s", e)
+        
+        if not all_results:
             await thinking_msg.edit_text(
                 f"\u274c \u041f\u043e \u0437\u0430\u043f\u0440\u043e\u0441\u0443 \u00ab{search_query}\u00bb \u043d\u0438\u0447\u0435\u0433\u043e \u043d\u0435 \u043d\u0430\u0439\u0434\u0435\u043d\u043e.\n\n"
                 f"\U0001f4a1 \u041f\u043e\u043f\u0440\u043e\u0431\u0443\u0439\u0442\u0435 \u0434\u0440\u0443\u0433\u043e\u0439 \u0437\u0430\u043f\u0440\u043e\u0441 \u0438\u043b\u0438 \u043f\u0440\u043e\u0432\u0435\u0440\u044c\u0442\u0435 \u043d\u0430\u043f\u0438\u0441\u0430\u043d\u0438\u0435.",
             )
             return
+        
+        # Deduplicate by book ID
+        seen_ids = set()
+        unique_results = []
+        for book in all_results:
+            bid = book.get("id", "")
+            if bid and bid not in seen_ids:
+                seen_ids.add(bid)
+                unique_results.append(book)
+            elif not bid:
+                unique_results.append(book)
+        
+        # Rank results by relevance to query and author
+        def _relevance_score(book):
+            score = 0
+            title_lower = book.get("title", "").lower()
+            query_lower = search_query.lower()
+            authors_lower = " ".join(book.get("authors", [])).lower()
+            
+            # Exact title match
+            if query_lower == title_lower:
+                score += 100
+            # Title contains full query
+            elif query_lower in title_lower:
+                score += 50
+            # All query words in title
+            query_words = query_lower.split()
+            matched_words = sum(1 for w in query_words if w in title_lower)
+            score += matched_words * 10
+            
+            # Author match (if Claude identified the author)
+            if search_author:
+                author_lower = search_author.lower()
+                if author_lower in authors_lower:
+                    score += 40
+                # Partial author match
+                for aw in author_lower.split():
+                    if aw in authors_lower:
+                        score += 15
+            
+            # Prefer Russian language
+            if book.get("language") == "ru":
+                score += 5
+            
+            # Prefer books with more formats (more likely to be popular)
+            score += min(len(book.get("formats", [])), 3)
+            
+            return score
+        
+        unique_results.sort(key=_relevance_score, reverse=True)
+        
+        # Limit to top 8
+        results = unique_results[:8]
         
         # Store results in context for callback
         context.user_data["book_search_results"] = results
@@ -1808,8 +2286,24 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 _bot_start_time = datetime.now()
 _messages_processed = 0
 
+class SilentHTTPServer(socketserver.ThreadingMixIn, HTTPServer):
+    """Многопоточный HTTP-сервер с подавлением BrokenPipeError."""
+    daemon_threads = True
+    allow_reuse_address = True
+
+    def handle_error(self, request, client_address):
+        """Подавляем BrokenPipeError вместо вывода traceback."""
+        import sys
+        exc_type = sys.exc_info()[0]
+        if exc_type is BrokenPipeError:
+            pass  # клиент отключился — это нормально
+        else:
+            super().handle_error(request, client_address)
+
+
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
+      try:
         if self.path == '/health' or self.path == '/':
             uptime = (datetime.now() - _bot_start_time).total_seconds()
             try:
@@ -1866,12 +2360,25 @@ h3 { margin: 4px 8px 8px; color: #4ade80; font-size: 14px; border-bottom: 1px so
         elif self.path == '/repos':
             try:
                 import urllib.request
-                req = urllib.request.Request(
-                    'https://api.github.com/users/sileade/repos?sort=updated&per_page=30',
-                    headers={'User-Agent': 'Nodkeys-Bot'}
-                )
-                with urllib.request.urlopen(req, timeout=10) as resp:
-                    repos = json.loads(resp.read().decode())
+                # Use cached repos if available and fresh (< 10 min)
+                import time as _time
+                _cache = getattr(HealthHandler, '_repos_cache', None)
+                _cache_time = getattr(HealthHandler, '_repos_cache_time', 0)
+                if _cache and (_time.time() - _cache_time) < 600:
+                    repos = _cache
+                else:
+                    headers = {'User-Agent': 'Nodkeys-Bot'}
+                    gh_token = os.getenv('GITHUB_TOKEN', '')
+                    if gh_token:
+                        headers['Authorization'] = f'token {gh_token}'
+                    req = urllib.request.Request(
+                        'https://api.github.com/users/sileade/repos?sort=updated&per_page=30',
+                        headers=headers
+                    )
+                    with urllib.request.urlopen(req, timeout=10) as resp:
+                        repos = json.loads(resp.read().decode())
+                    HealthHandler._repos_cache = repos
+                    HealthHandler._repos_cache_time = _time.time()
                 html = '''<!DOCTYPE html>
 <html><head><meta charset="utf-8">
 <style>
@@ -2004,12 +2511,16 @@ h3 { margin: 4px 8px 8px; color: #4ade80; font-size: 14px; border-bottom: 1px so
         else:
             self.send_response(404)
             self.end_headers()
+      except BrokenPipeError:
+          pass  # клиент отключился
+      except Exception as e:
+          logger.warning("Health handler error: %s", e)
     
     def log_message(self, format, *args):
         pass  # Suppress health check logs
 
 def start_health_server(port=8085):
-    server = HTTPServer(('0.0.0.0', port), HealthHandler)
+    server = SilentHTTPServer(('0.0.0.0', port), HealthHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     logger.info("Health check server started on port %d", port)
@@ -2048,7 +2559,20 @@ def main():
     except ImportError:
         logger.warning("iCal proxy not available")
 
-    app = Application.builder().token(BOT_TOKEN).build()
+    # Build application with optional SOCKS5 proxy and custom base URL for Telegram API
+    builder = Application.builder().token(BOT_TOKEN)
+    
+    if TELEGRAM_PROXY_URL:
+        from telegram.request import HTTPXRequest
+        logger.info("Using Telegram proxy: %s", TELEGRAM_PROXY_URL)
+        proxy_request = HTTPXRequest(proxy=TELEGRAM_PROXY_URL)
+        builder = builder.request(proxy_request).get_updates_request(HTTPXRequest(proxy=TELEGRAM_PROXY_URL))
+    
+    if TELEGRAM_BASE_URL:
+        logger.info("Using custom Telegram base URL: %s", TELEGRAM_BASE_URL)
+        builder = builder.base_url(TELEGRAM_BASE_URL)
+    
+    app = builder.build()
 
     # Register handlers
     app.add_handler(CommandHandler("start", cmd_start))
@@ -2059,6 +2583,7 @@ def main():
     app.add_handler(CommandHandler("cleanup", cmd_cleanup))
     app.add_handler(CallbackQueryHandler(callback_delete, pattern=r"^del:"))
     app.add_handler(CallbackQueryHandler(callback_book, pattern=r"^book:"))
+    app.add_handler(CallbackQueryHandler(callback_bookdev, pattern=r"^bookdev:"))
 
     # Kindle handlers
     try:

@@ -1,4 +1,4 @@
-# Nodkeys Calendar & Life Bot v4.1
+# Nodkeys Calendar & Life Bot v4.2
 
 A powerful, self-hosted Telegram bot that acts as a **unified personal assistant**. Write naturally in Telegram — the bot analyzes your message with **Claude AI** and automatically routes it to the right service: Apple Calendar, Apple Notes, diary, book search, or Kindle delivery.
 
@@ -36,7 +36,7 @@ The bot uses **Claude AI** to understand the intent behind every message and rou
 | **Reminder** | "Don't forget to call dentist" | Apple Calendar |
 | **Note** | "Remember: WiFi password is 12345" | Apple Notes |
 | **Diary** | "Today I realized I need more sleep" | Apple Notes (daily diary) |
-| **Book Search** | "Find book Master and Margarita" | Flibusta OPDS → Kindle |
+| **Book Search** | "Find book Master and Margarita" | Flibusta/Anna's Archive/Jackett → Kindle |
 
 ### Calendar Management (Apple Calendar via iCloud CalDAV)
 
@@ -59,15 +59,17 @@ The bot uses **Claude AI** to understand the intent behind every message and rou
 | **Chronography** | Each diary entry includes a timestamp, one note per day |
 | **Auto-append** | Multiple diary entries per day are appended to the same note |
 
-### Book Search (Flibusta OPDS)
+### Book Search (Flibusta, Anna's Archive, Jackett)
 
 | Feature | Description |
 | --- | --- |
 | **Natural Language** | "Find book..." or "I want to read..." triggers search |
-| **Flibusta OPDS** | Searches the Flibusta library via OPDS protocol |
+| **Multi-Source Search** | Searches Flibusta (OPDS + HTML fallback), Anna's Archive, and Jackett |
+| **AI Rethink** | If a book isn't found, Claude AI suggests alternative titles (e.g., translated names) and retries |
+| **Smart Ranking** | Results are ranked by relevance (exact match, author match, Russian language preference) |
 | **Format Selection** | Shows available formats (EPUB, FB2, MOBI, etc.) |
 | **Kindle Delivery** | Downloads, converts if needed, and sends to Kindle |
-| **Interactive** | Inline buttons for book selection |
+| **Interactive** | Inline buttons for book selection and Kindle device selection |
 
 ### Kindle Document Delivery
 
@@ -166,7 +168,8 @@ docker run -d \
 | `KINDLE_EMAIL_PASSWORD` | Email app-specific password | **Yes** |
 | `KINDLE_SMTP_HOST` | SMTP server host | No |
 | `KINDLE_SMTP_PORT` | SMTP server port | No |
-| `KINDLE_DEVICES` | Multi-device config | No |
+| `KINDLE_DEVICES` | Multi-device config (e.g., `Name:email@kindle.com`) | No |
+| `GITHUB_TOKEN` | GitHub Personal Access Token for `/repos` endpoint | No |
 | `OPENAI_API_KEY` | OpenAI API key for format analysis | No |
 | `FLIBUSTA_BASE_URL` | Flibusta mirror URL | No |
 
@@ -300,6 +303,15 @@ Add to your Homepage `services.yaml`:
 | Container | Docker |
 
 ## Changelog
+
+### v4.2 (2026-04-17)
+- **Enhanced Book Search** — added HTML web-parsing fallback for Flibusta, plus Anna's Archive and Jackett integrations
+- **AI Rethink for Books** — Claude AI automatically suggests alternative titles if a book is not found and retries the search
+- **Smart Result Ranking** — book search results are now ranked by relevance (exact match, author, language)
+- **Interactive Kindle Selection** — added inline buttons to choose which Kindle device to send the book to
+- **Health Server Improvements** — replaced HTTPServer with ThreadingHTTPServer for better stability and added BrokenPipeError handling
+- **GitHub Repos Endpoint** — added caching and GitHub token support to prevent rate limits on the Homepage dashboard
+- **SMTP Fallback** — improved email delivery reliability with a fallback chain for SMTP passwords
 
 ### v4.1 (2026-04-16)
 - **Apple Notes integration** — notes saved to Apple Notes via iCloud IMAP
