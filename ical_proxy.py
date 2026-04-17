@@ -6,9 +6,10 @@ Runs alongside the calendar bot on port 8086.
 import os
 import json
 import logging
+import socketserver
 import threading
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from zoneinfo import ZoneInfo
 
@@ -19,8 +20,8 @@ logger = logging.getLogger("ical-proxy")
 
 ICLOUD_USERNAME = os.environ.get("ICLOUD_USERNAME", "slilea@icloud.com")
 ICLOUD_PASSWORD = os.environ.get("ICLOUD_PASSWORD", "")
-CALDAV_URL = "https://caldav.icloud.com"
-TZ = ZoneInfo("Europe/Kyiv")
+CALDAV_URL = os.environ.get("CALDAV_URL", "https://caldav.icloud.com")  # BUG-16: was hardcoded
+TZ = ZoneInfo(os.environ.get("TZ", "Europe/Moscow"))  # BUG-03: was hardcoded Europe/Kyiv
 
 # Cache
 _ical_cache = {}
@@ -78,11 +79,10 @@ def escape_ical_text(text):
         return ""
     # Replace actual newlines with \n
     text = text.replace("\r\n", "\\n").replace("\r", "\\n").replace("\n", "\\n")
-    # Escape commas and semicolons
+    # BUG-13: Always escape semicolons and commas properly
+    text = text.replace("\\", "\\\\")  # Escape backslashes first
     text = text.replace(";", "\\;")
-    # Don't double-escape commas that are already escaped
-    if "\\," not in text:
-        text = text.replace(",", "\\,")
+    text = text.replace(",", "\\,")
     return text
 
 
@@ -94,8 +94,12 @@ def fetch_ical_data():
         calendars = principal.calendars()
 
         now = datetime.now(TZ)
+        # BUG-14: Use UTC for DTSTAMP
+        utc_now = datetime.now(timezone.utc)
         start = now - timedelta(days=30)
         end = now + timedelta(days=365)
+
+        tz_name = str(TZ)
 
         lines = []
         lines.append("BEGIN:VCALENDAR")
@@ -103,7 +107,7 @@ def fetch_ical_data():
         lines.append("PRODID:-//Nodkeys//Calendar Bot//EN")
         lines.append("CALSCALE:GREGORIAN")
         lines.append("METHOD:PUBLISH")
-        lines.append("X-WR-TIMEZONE:Europe/Kyiv")
+        lines.append(f"X-WR-TIMEZONE:{tz_name}")
 
         for cal in calendars:
             cal_name = cal.name or "Unknown"
@@ -149,8 +153,8 @@ def fetch_ical_data():
                                 loc = escape_ical_text(component.location.value)
                                 lines.append(fold_ical_line(f"LOCATION:{loc}"))
                             
-                            # Add DTSTAMP (required by RFC)
-                            lines.append(f"DTSTAMP:{now.strftime('%Y%m%dT%H%M%SZ')}")
+                            # BUG-14: Use UTC time for DTSTAMP (Z suffix means UTC)
+                            lines.append(f"DTSTAMP:{utc_now.strftime('%Y%m%dT%H%M%SZ')}")
                             
                             # Calendar name as category
                             cat_name = escape_ical_text(cal_name.strip())
@@ -189,8 +193,25 @@ def get_cached_ical():
     return data
 
 
+# BUG-04: Use ThreadingMixIn like bot.py
+class SilentICalServer(socketserver.ThreadingMixIn, HTTPServer):
+    """Threaded HTTP server with BrokenPipeError suppression."""
+    daemon_threads = True
+    allow_reuse_address = True
+
+    def handle_error(self, request, client_address):
+        import sys
+        exc_type = sys.exc_info()[0]
+        if exc_type is BrokenPipeError:
+            pass
+        else:
+            super().handle_error(request, client_address)
+
+
 class ICalHandler(BaseHTTPRequestHandler):
     def do_GET(self):
+      # BUG-05: Add BrokenPipeError handling
+      try:
         if self.path.startswith("/calendar.ics") or self.path == "/":
             ical_data = get_cached_ical()
             if ical_data:
@@ -213,13 +234,17 @@ class ICalHandler(BaseHTTPRequestHandler):
         else:
             self.send_response(404)
             self.end_headers()
+      except BrokenPipeError:
+          pass  # Client disconnected
+      except Exception as e:
+          logger.warning("iCal handler error: %s", e)
 
     def log_message(self, format, *args):
         pass  # Suppress access logs
 
 
 def run_server(port=8086):
-    server = HTTPServer(("0.0.0.0", port), ICalHandler)
+    server = SilentICalServer(("0.0.0.0", port), ICalHandler)
     logger.info("iCal proxy server started on port %d", port)
     server.serve_forever()
 

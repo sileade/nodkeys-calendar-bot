@@ -1,6 +1,6 @@
-# Nodkeys Calendar & Life Bot v4.2
+# Nodkeys Calendar & Life Bot v5.0
 
-A powerful, self-hosted Telegram bot that acts as a **unified personal assistant**. Write naturally in Telegram — the bot analyzes your message with **Claude AI** and automatically routes it to the right service: Apple Calendar, Apple Notes, diary, book search, or Kindle delivery.
+A powerful, self-hosted Telegram bot that acts as a **unified personal assistant**. Write naturally in Telegram — the bot analyzes your message with **Claude AI** and automatically routes it to the right service: Apple Calendar, Apple Notes, diary, book search, X-Ray analysis, URL-to-Kindle, or Kindle delivery.
 
 **No commands needed** — just write what you think.
 
@@ -18,7 +18,10 @@ You write in Telegram
 │  "Remember: WiFi password 12345"  │ → 📝 Apple Notes (note)
 │  "Today I realized I need rest"   │ → 📔 Apple Notes (diary)
 │  "Find book Master & Margarita"   │ → 📚 Flibusta → Kindle
+│  "X-Ray по Войне и миру"         │ → 🔬 AI literary analysis
+│  "На киндл https://habr.com/..."  │ → 🌐 URL → EPUB → Kindle
 │  sent_file.epub                   │ → 📖 Convert → Kindle
+│  My Clippings.txt                 │ → 📎 AI analysis of highlights
 │  https://habr.com/article/123     │ → 🔗 Calendar (review task)
 └───────────────────────────────────┘
 ```
@@ -37,6 +40,8 @@ The bot uses **Claude AI** to understand the intent behind every message and rou
 | **Note** | "Remember: WiFi password is 12345" | Apple Notes |
 | **Diary** | "Today I realized I need more sleep" | Apple Notes (daily diary) |
 | **Book Search** | "Find book Master and Margarita" | Flibusta/Anna's Archive/Jackett → Kindle |
+| **X-Ray** | "X-Ray по Мастеру и Маргарите" | AI literary analysis |
+| **URL → Kindle** | "На киндл https://habr.com/article" | Download → EPUB → Kindle |
 
 ### Calendar Management (Apple Calendar via iCloud CalDAV)
 
@@ -65,11 +70,52 @@ The bot uses **Claude AI** to understand the intent behind every message and rou
 | --- | --- |
 | **Natural Language** | "Find book..." or "I want to read..." triggers search |
 | **Multi-Source Search** | Searches Flibusta (OPDS + HTML fallback), Anna's Archive, and Jackett |
-| **AI Rethink** | If a book isn't found, Claude AI suggests alternative titles (e.g., translated names) and retries |
-| **Smart Ranking** | Results are ranked by relevance (exact match, author match, Russian language preference) |
+| **AI Rethink** | If a book isn't found, Claude AI suggests alternative titles and retries |
+| **Smart Ranking** | Results are ranked by relevance (exact match, author match, language) |
 | **Format Selection** | Shows available formats (EPUB, FB2, MOBI, etc.) |
 | **Kindle Delivery** | Downloads, converts if needed, and sends to Kindle |
 | **Interactive** | Inline buttons for book selection and Kindle device selection |
+
+### X-Ray Book Analysis (NEW in v5.0)
+
+Generate a structured literary analysis for any book, inspired by Amazon Kindle X-Ray.
+
+| Feature | Description |
+| --- | --- |
+| **Characters** | Up to 10 key characters with roles and descriptions |
+| **Themes** | Main themes and motifs of the book |
+| **Locations** | Key locations and their significance |
+| **Timeline** | Chronological overview of events |
+| **Fun Facts** | Interesting facts about the book and author |
+| **Spoiler-Free** | Specify reading progress (%) to avoid spoilers |
+
+Usage: `/xray Мастер и Маргарита` or write "сделай x-ray по Войне и миру"
+
+### URL → Kindle (NEW in v5.0)
+
+Send any web article to your Kindle as a clean EPUB.
+
+| Feature | Description |
+| --- | --- |
+| **Smart Extraction** | Extracts main article content, removes ads and navigation |
+| **Clean EPUB** | Converts to well-formatted EPUB with proper typography |
+| **Calibre Fallback** | Uses Calibre for conversion, falls back to HTML if unavailable |
+| **Device Selection** | Choose which Kindle device to send to |
+| **History Tracking** | All sent articles are saved in book history |
+
+Usage: "Отправь на киндл https://habr.com/article/123" or "На читалку https://medium.com/post"
+
+### Kindle Clippings Analysis (NEW in v5.0)
+
+Send your Kindle's `My Clippings.txt` file to get an AI-powered analysis of your highlights.
+
+| Feature | Description |
+| --- | --- |
+| **Auto-Detection** | Automatically detects Clippings files by name |
+| **Multi-Book Parsing** | Groups highlights by book, removes duplicates |
+| **AI Summary** | Claude generates Key Takeaways and Best Quotes per book |
+| **Action Items** | Practical suggestions based on your reading highlights |
+| **Reading Patterns** | Overall themes and patterns across your reading |
 
 ### Kindle Document Delivery
 
@@ -98,9 +144,12 @@ Telegram Bot (python-telegram-bot)
 │   ├── event/task/reminder → Apple Calendar (iCloud CalDAV)
 │   ├── note → Apple Notes (iCloud IMAP)
 │   ├── diary → Apple Notes Daily Diary (iCloud IMAP)
-│   └── book_search → Flibusta OPDS → Kindle
+│   ├── book_search → Flibusta OPDS → Kindle
+│   ├── xray → Claude AI Literary Analysis
+│   └── url_to_kindle → Download → EPUB → Kindle
 ├── Kindle Handler (OpenAI + Calibre + SMTP)
 │   ├── AI Format Analysis (OpenAI GPT-4.1-nano)
+│   ├── Kindle Clippings Parser + AI Summary
 │   ├── Format Conversion (Calibre ebook-convert)
 │   └── Email Delivery (iCloud SMTP)
 ├── Health Check Server (:8085)
@@ -136,14 +185,15 @@ cp .env.example .env
 ### 3. Build and run
 
 ```shell
-docker build -t calendar-life-bot:latest .
+docker build -t calendar-bot:v5.0 .
 docker run -d \
   --name calendar-bot \
   --restart unless-stopped \
   --env-file .env \
+  -v ./data:/app/data \
   -p 8085:8085 \
   -p 8086:8086 \
-  calendar-life-bot:latest
+  calendar-bot:v5.0
 ```
 
 ## Configuration
@@ -154,8 +204,11 @@ docker run -d \
 | --- | --- | :-: |
 | `TELEGRAM_BOT_TOKEN` | Telegram bot token from @BotFather | **Yes** |
 | `TELEGRAM_CHAT_ID` | Allowed Telegram chat ID | **Yes** |
+| `TELEGRAM_PROXY_URL` | SOCKS5 proxy for Telegram API | No |
+| `TELEGRAM_BASE_URL` | Custom Telegram API base URL | No |
 | `CLAUDE_API_KEY` | Anthropic Claude API key | **Yes** |
 | `CLAUDE_MODEL` | Claude model name | No |
+| `CLAUDE_PROXY_URL` | SOCKS5 proxy for Claude API | No |
 | `ICLOUD_USERNAME` | iCloud email (used for CalDAV + IMAP Notes) | **Yes** |
 | `ICLOUD_PASSWORD` | iCloud app-specific password | **Yes** |
 | `CALDAV_URL` | CalDAV server URL | No |
@@ -168,10 +221,14 @@ docker run -d \
 | `KINDLE_EMAIL_PASSWORD` | Email app-specific password | **Yes** |
 | `KINDLE_SMTP_HOST` | SMTP server host | No |
 | `KINDLE_SMTP_PORT` | SMTP server port | No |
-| `KINDLE_DEVICES` | Multi-device config (e.g., `Name:email@kindle.com`) | No |
-| `GITHUB_TOKEN` | GitHub Personal Access Token for `/repos` endpoint | No |
+| `KINDLE_DEVICES` | Multi-device config | No |
+| `KINDLE_TMP_DIR` | Temp directory for file processing | No |
+| `KINDLE_BOOKS_STORAGE` | Persistent book storage path | No |
+| `KINDLE_BOOKS_DB` | Book history JSON database path | No |
+| `GITHUB_TOKEN` | GitHub PAT for `/repos` endpoint | No |
 | `OPENAI_API_KEY` | OpenAI API key for format analysis | No |
 | `FLIBUSTA_BASE_URL` | Flibusta mirror URL | No |
+| `FLIBUSTA_PROXY_URL` | SOCKS5 proxy for Flibusta | No |
 
 ### Multi-Kindle Device Setup
 
@@ -187,6 +244,8 @@ KINDLE_DEVICES="My Kindle:email1@kindle.com|Family Kindle:email2@kindle.com"
 | `/help` | Show usage guide with examples |
 | `/today` | List today's calendar events |
 | `/calendars` | Show configured calendars |
+| `/book <query>` | Search for books on Flibusta |
+| `/xray <title>` | Generate X-Ray analysis for a book |
 | `/delete <keyword>` | Search and delete events |
 | `/cleanup` | Remove all bot-created events |
 
@@ -212,6 +271,18 @@ KINDLE_DEVICES="My Kindle:email1@kindle.com|Family Kindle:email2@kindle.com"
 - "I want to read something by Stephen King" → searches by author
 - "Download 1984 Orwell" → finds and sends to Kindle
 
+**X-Ray (NEW):**
+- `/xray Мастер и Маргарита` → characters, themes, locations, timeline
+- "Сделай x-ray по Войне и миру" → AI literary analysis
+- "X-ray 1984 Orwell, я на 50%" → spoiler-free analysis up to 50%
+
+**URL → Kindle (NEW):**
+- "Отправь на киндл https://habr.com/article/123" → downloads, cleans, sends as EPUB
+- "На читалку https://medium.com/post" → article to Kindle
+
+**Kindle Clippings (NEW):**
+- Send `My Clippings.txt` file → AI-powered analysis of your highlights
+
 **Kindle:**
 - Send any .epub, .fb2, .pdf file → bot analyzes, converts, sends to Kindle
 
@@ -231,7 +302,7 @@ Response:
 ```json
 {
   "status": "ok",
-  "bot": "Nodkeys Calendar & Life Bot v4.1",
+  "bot": "Nodkeys Calendar & Life Bot v5.0",
   "uptime_seconds": 3600,
   "messages_processed": 42,
   "kindle_sent": 5,
@@ -272,7 +343,7 @@ Add to your Homepage `services.yaml`:
 - Calendar Bot:
     icon: mdi-robot
     href: https://t.me/your_bot
-    description: AI Calendar & Life Bot
+    description: AI Calendar & Life Bot v5.0
     widget:
       type: customapi
       url: http://calendar-bot:8085/health
@@ -287,6 +358,10 @@ Add to your Homepage `services.yaml`:
           format: number
 ```
 
+## Deploy & Rollback
+
+See [DEPLOY.md](DEPLOY.md) for detailed deployment instructions, rollback procedures, and monitoring checklist.
+
 ## Tech Stack
 
 | Component | Technology |
@@ -297,12 +372,22 @@ Add to your Homepage `services.yaml`:
 | Format AI | OpenAI GPT-4.1-nano |
 | Calendar | iCloud CalDAV |
 | Notes & Diary | iCloud IMAP (Apple Notes) |
-| Book Search | Flibusta OPDS |
+| Book Search | Flibusta OPDS + HTML, Anna's Archive, Jackett |
+| Article Extraction | BeautifulSoup4 |
 | Conversion | Calibre (ebook-convert) |
 | Email | SMTP (iCloud Mail) |
 | Container | Docker |
 
 ## Changelog
+
+### v5.0 (2026-04-17)
+- **X-Ray Book Analysis** — `/xray` command and natural language trigger for AI-powered literary analysis (characters, themes, locations, timeline, fun facts) with spoiler-free mode
+- **URL → Kindle** — send web articles to Kindle as clean EPUB; smart content extraction removes ads, navigation, and trackers; Calibre conversion with HTML fallback
+- **Kindle Clippings Parser** — auto-detects `My Clippings.txt`, parses highlights by book, generates AI summary with Key Takeaways and Action Items
+- **18 Bug Fixes** — URL regex trailing punctuation, unused imports, f-string fixes, ical_proxy rewrite with proper RFC 5545 compliance, path traversal sanitization
+- **Dockerfile Improvements** — added HEALTHCHECK, VOLUME for persistent data, EXPOSE ports
+- **Complete .env.example** — documented all environment variables including proxies and storage paths
+- **Deploy & Rollback Guide** — added DEPLOY.md with step-by-step deploy, rollback, and monitoring checklist
 
 ### v4.2 (2026-04-17)
 - **Enhanced Book Search** — added HTML web-parsing fallback for Flibusta, plus Anna's Archive and Jackett integrations
@@ -317,8 +402,7 @@ Add to your Homepage `services.yaml`:
 - **Apple Notes integration** — notes saved to Apple Notes via iCloud IMAP
 - **Daily diary with chronography** — one note per day, each entry with timestamp
 - **Book search via natural language** — "Find book..." triggers Flibusta OPDS search
-- **Unified message routing** — all 6 types (event, task, reminder, note, diary, book_search) handled through Claude AI analysis
-- **No commands needed** — removed `/book` command, everything works through natural language
+- **Unified message routing** — all 6 types handled through Claude AI analysis
 - **Kindle integration with book search** — search → select → download → convert → send to Kindle
 
 ### v3.2 (2026-04-14)

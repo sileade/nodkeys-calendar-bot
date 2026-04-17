@@ -10,8 +10,7 @@ import json
 import logging
 import smtplib
 import subprocess
-import tempfile
-import mimetypes
+# tempfile and mimetypes removed — unused
 from email.mime.multipart import MIMEMultipart
 from email.mime.base import MIMEBase
 from email.mime.text import MIMEText
@@ -222,7 +221,7 @@ Respond in JSON:
             "format_detected": file_ext.lstrip(".").upper(),
             "needs_conversion": not is_kindle_native(file_ext),
             "recommended_output": "epub" if not is_kindle_native(file_ext) else "direct",
-            "reason": f"AI анализ недоступен, используем стандартную логику",
+            "reason": "AI анализ недоступен, используем стандартную логику",
             "confidence": 0.5,
         }
 
@@ -376,6 +375,85 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     file_ext = get_file_extension(filename)
     file_size = doc.file_size or 0
 
+    # ── Kindle Clippings Detection ──
+    original_name = (doc.file_name or "").lower()
+    if "clipping" in original_name or "my clippings" in original_name:
+        thinking_msg = await update.message.reply_text(
+            "📎 <b>Обнаружен Kindle Clippings!</b>\n"
+            "🔄 Анализирую цитаты...",
+            parse_mode="HTML",
+        )
+        try:
+            os.makedirs(TMP_DIR, exist_ok=True)
+            tg_file = await context.bot.get_file(doc.file_id)
+            local_path = os.path.join(TMP_DIR, filename)
+            await tg_file.download_to_drive(local_path)
+            
+            with open(local_path, "r", encoding="utf-8-sig") as f:
+                clippings_text = f.read()
+            
+            # Import parser from bot.py
+            import sys
+            bot_module = sys.modules.get("__main__")
+            if bot_module and hasattr(bot_module, "parse_kindle_clippings"):
+                books = bot_module.parse_kindle_clippings(clippings_text)
+            else:
+                # Inline fallback parser
+                books = {}
+                for entry in clippings_text.split("=========="):
+                    entry = entry.strip()
+                    if not entry:
+                        continue
+                    lines = entry.split("\n")
+                    if len(lines) < 3:
+                        continue
+                    title = lines[0].strip().lstrip("\ufeff")
+                    hl = []
+                    found = False
+                    for line in lines[1:]:
+                        if not found and line.strip() == "":
+                            found = True
+                            continue
+                        if found and line.strip():
+                            hl.append(line.strip())
+                    highlight = " ".join(hl).strip()
+                    if highlight and title:
+                        books.setdefault(title, [])
+                        if highlight not in books[title]:
+                            books[title].append(highlight)
+            
+            if not books:
+                await thinking_msg.edit_text("❌ Не удалось распарсить цитаты из файла.")
+                return
+            
+            total = sum(len(v) for v in books.values())
+            await thinking_msg.edit_text(
+                f"📚 Найдено {total} цитат из {len(books)} книг.\n"
+                f"🧠 Генерирую анализ..."
+            )
+            
+            if bot_module and hasattr(bot_module, "summarize_clippings_with_ai"):
+                import asyncio
+                result = await asyncio.to_thread(bot_module.summarize_clippings_with_ai, books)
+            else:
+                result = "📚 <b>Kindle Clippings</b>\n\n"
+                for title, highlights in sorted(books.items(), key=lambda x: -len(x[1])):
+                    result += f"\u2022 <b>{title}</b> \u2014 {len(highlights)} цитат\n"
+            
+            await thinking_msg.edit_text(result, parse_mode="HTML")
+        except Exception as e:
+            logger.error("Clippings parse error: %s", e)
+            await thinking_msg.edit_text(f"❌ Ошибка анализа Clippings: {str(e)[:200]}")
+        finally:
+            try:
+                for f in os.listdir(TMP_DIR):
+                    fp = os.path.join(TMP_DIR, f)
+                    if os.path.isfile(fp):
+                        os.remove(fp)
+            except Exception:
+                pass
+        return
+
     # Check if it's a supported format
     if not is_kindle_native(file_ext) and not is_convertible(file_ext):
         await update.message.reply_text(
@@ -407,7 +485,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     conf_emoji = "🟢" if confidence >= 0.8 else "🟡" if confidence >= 0.5 else "🔴"
 
-    info_text = f"📖 <b>Анализ файла</b>\n\n"
+    info_text = "📖 <b>Анализ файла</b>\n\n"
     info_text += f"📄 <b>Файл:</b> {filename}\n"
     info_text += f"📊 <b>Формат:</b> {ai_result.get('format_detected', file_ext.upper())}\n"
     info_text += f"📏 <b>Размер:</b> {file_size / 1024:.0f} KB\n"
@@ -418,7 +496,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if needs_conversion:
         info_text += f"\n🔄 <b>Конвертация:</b> {file_ext.upper()} → {recommended.upper()}\n"
     else:
-        info_text += f"\n✅ <b>Формат поддерживается Kindle напрямую</b>\n"
+        info_text += "\n✅ <b>Формат поддерживается Kindle напрямую</b>\n"
     if reason:
         info_text += f"💡 <i>{reason}</i>\n"
     info_text += f"\n{conf_emoji} Уверенность AI: {confidence:.0%}"
@@ -538,7 +616,7 @@ async def callback_kindle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         success, error_msg = send_email_to_kindle(send_path, kindle_email, subject)
 
         if success:
-            result_text = f"✅ <b>Отправлено на Kindle!</b>\n\n"
+            result_text = "✅ <b>Отправлено на Kindle!</b>\n\n"
             result_text += f"📄 <b>Файл:</b> {os.path.basename(send_path)}\n"
             if title:
                 result_text += f"📕 <b>Название:</b> {title}\n"
@@ -547,7 +625,7 @@ async def callback_kindle(update: Update, context: ContextTypes.DEFAULT_TYPE):
             result_text += f"📱 <b>Устройство:</b> {kindle_email}\n"
             if converted:
                 result_text += f"🔄 <b>Конвертировано:</b> {file_info['file_ext'].upper()} → {file_info['recommended_output'].upper()}\n"
-            result_text += f"\n📬 <i>Книга появится на Kindle через 1-5 минут</i>"
+            result_text += "\n📬 <i>Книга появится на Kindle через 1-5 минут</i>"
 
             # Store book file permanently
             book_id = len(_books_history) + 1

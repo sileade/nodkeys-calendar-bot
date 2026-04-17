@@ -1,14 +1,19 @@
 #!/usr/bin/env python3
 """
-Nodkeys Calendar & Life Bot v4.1
+Nodkeys Calendar & Life Bot v5.0
 Telegram bot that analyzes messages using Claude AI and routes them:
 - Events/Tasks/Reminders → Apple Calendar (iCloud CalDAV)
 - Notes → Apple Notes (iCloud IMAP)
 - Diary entries → Apple Notes diary with chronography (one note per day)
-- Book search → Flibusta OPDS search + Kindle delivery
+- Book search → Flibusta OPDS + Anna's Archive + Jackett + AI Rethink
 - Kindle: AI format detection, Calibre conversion, SMTP delivery
+- X-Ray: AI-powered book analysis (characters, themes, timeline)
+- Kindle Clippings: parse My Clippings.txt → key takeaways
+- URL→Kindle: send web articles to Kindle as clean EPUB
 - All through natural language — no commands needed
 """
+
+VERSION = "5.0"
 
 import os
 import re
@@ -24,15 +29,15 @@ import time as _time
 import xml.etree.ElementTree as ET
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import socketserver
-from datetime import datetime, timedelta, date
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from urllib.parse import urlparse, quote
 from urllib.request import Request, urlopen
-from urllib.error import URLError, HTTPError
+# URLError/HTTPError handled inline via urllib
 
 import anthropic
 import caldav
-from telegram import Update, BotCommand, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -96,7 +101,7 @@ if FLIBUSTA_PROXY_URL:
         timeout=FLIBUSTA_TIMEOUT,
         verify=False,
         follow_redirects=True,
-        headers={"User-Agent": "NodkeysBot/4.1", "Accept": "application/atom+xml"},
+        headers={"User-Agent": f"NodkeysBot/{VERSION}", "Accept": "application/atom+xml"},
     )
     logger_init_msg = f"Flibusta using proxy: {FLIBUSTA_PROXY_URL}"
 else:
@@ -104,7 +109,7 @@ else:
         timeout=FLIBUSTA_TIMEOUT,
         verify=False,
         follow_redirects=True,
-        headers={"User-Agent": "NodkeysBot/4.1", "Accept": "application/atom+xml"},
+        headers={"User-Agent": f"NodkeysBot/{VERSION}", "Accept": "application/atom+xml"},
     )
     logger_init_msg = "Flibusta direct (no proxy)"
 
@@ -119,12 +124,19 @@ logger.info(logger_init_msg)
 
 # ──────────────────── URL Detection ────────────────────
 URL_REGEX = re.compile(
-    r'https?://[^\s<>\"\'\)\]]+', re.IGNORECASE
+    r'https?://[^\s<>\"\'\'\)\]]+', re.IGNORECASE
 )
 
 def extract_urls(text: str) -> list[str]:
-    """Extract all URLs from text."""
-    return URL_REGEX.findall(text)
+    """Extract all URLs from text, stripping trailing punctuation."""
+    urls = URL_REGEX.findall(text)
+    cleaned = []
+    for url in urls:
+        # Strip trailing punctuation that's not part of URL
+        url = url.rstrip('.,;:!?)')
+        if url:
+            cleaned.append(url)
+    return cleaned
 
 def get_url_domain(url: str) -> str:
     """Get human-readable domain from URL."""
@@ -433,7 +445,6 @@ def _search_flibusta_web(query: str, limit: int = 10) -> list[dict]:
         
         # Parse book entries: <li><a href="/b/BOOK_ID">Title</a> - <a href="/a/AUTHOR_ID">Author</a></li>
         # Titles may contain <span> tags for highlighting
-        import re
         # Extract each <li> block
         li_pattern = re.compile(r'<li>(.*?)</li>', re.DOTALL)
         book_id_pattern = re.compile(r'href="/b/(\d+)"')
@@ -641,7 +652,7 @@ def download_book(book_id: int, fmt: str = "epub") -> tuple[bytes | None, str]:
             timeout=60,
             verify=False,
             follow_redirects=True,
-            headers={"User-Agent": "NodkeysBot/4.1"},
+            headers={"User-Agent": f"NodkeysBot/{VERSION}"},
         )
         
         try:
@@ -742,6 +753,8 @@ SYSTEM_PROMPT = """Ты — умный ассистент-планировщик
 - `note` — заметка, мысль, идея, информация для запоминания (без привязки к дате/времени)
 - `diary` — личная запись, мысль о жизни, рефлексия, наблюдение, что-то о себе, дневниковая запись
 - `book_search` — пользователь хочет найти книгу, скачать книгу, отправить книгу на Kindle
+- `xray` — пользователь хочет получить X-Ray анализ книги (персонажи, темы, таймлайн)
+- `url_to_kindle` — пользователь хочет отправить веб-статью/URL на Kindle
 
 Запись НЕ нужна если:
 - Сообщение слишком абстрактное ("ок", "да", "понял")
@@ -789,6 +802,15 @@ SYSTEM_PROMPT = """Ты — умный ассистент-планировщик
    - `title` — краткое описание что ищем (для отображения пользователю)
    - `send_to_kindle` — true если пользователь явно просит отправить на Kindle/читалку
 
+### Для xray (X-Ray анализ книги):
+   - `book_title` — название книги для анализа
+   - `author` — автор книги (null если не указан)
+   - `progress_percent` — процент прочтения (null если не указан, 100 если прочитал)
+
+### Для url_to_kindle (URL → Kindle):
+   - `url` — ссылка на статью/страницу
+   - `title` — название статьи (если понятно из контекста)
+
 Текущая дата и время: {current_datetime}
 День недели: {weekday}
 Часовой пояс: Europe/Moscow
@@ -810,6 +832,8 @@ SYSTEM_PROMPT = """Ты — умный ассистент-планировщик
 - "Запиши заметку", "сохрани", "запомни что..." → note
 - "Сегодня я понял что...", "Интересное наблюдение...", личные мысли → diary
 - "Найди книгу...", "Скачай...", "Хочу почитать...", "Отправь на Kindle..." → book_search
+- "Сделай x-ray", "Анализ персонажей", "О чём книга", "Темы книги" → xray
+- "Отправь статью на киндл", "На киндл [URL]", "Почитать на читалке [URL]" → url_to_kindle
 
 ## Правила определения уверенности (confidence):
 - 0.95-1.0 — чёткая дата, время, конкретное действие
@@ -867,6 +891,37 @@ SYSTEM_PROMPT = """Ты — умный ассистент-планировщик
   "confidence": 0.95,
   "reasoning": "Пользователь просит отправить на Kindle книгу 'Странник среди звёзд'. Автор — Роберт Хайнлайн (классика НФ)."
 }}
+
+Для xray:
+{{
+  "action": "create",
+  "type": "xray",
+  "book_title": "Мастер и Маргарита",
+  "author": "Булгаков",
+  "progress_percent": 50,
+  "confidence": 0.95,
+  "reasoning": "Пользователь просит X-Ray анализ книги"
+}}
+
+Для url_to_kindle:
+{{
+  "action": "create",
+  "type": "url_to_kindle",
+  "url": "https://habr.com/ru/articles/123456/",
+  "title": "Статья про Python",
+  "confidence": 0.95,
+  "reasoning": "Пользователь просит отправить статью на Kindle"
+}}
+
+Примеры анализа xray:
+- "Сделай x-ray по Войне и миру" → type: "xray", book_title: "Война и мир", author: "Толстой"
+- "Анализ персонажей 1984" → type: "xray", book_title: "1984", author: "Оруэлл"
+- "Читаю Мастера и Маргариту, на 50%, сделай xray" → type: "xray", progress_percent: 50
+
+Примеры анализа url_to_kindle:
+- "Отправь эту статью на киндл https://habr.com/article/123" → type: "url_to_kindle", url: "https://habr.com/article/123"
+- "На киндл https://example.com/long-read" → type: "url_to_kindle"
+- "Хочу почитать на читалке https://medium.com/article" → type: "url_to_kindle"
 
 Примеры анализа book_search:
 - "Отправь на киндл войну и мир" → query: "Война и мир", author: "Толстой", search_queries: ["Война и мир Толстой", "Война и мир"]
@@ -1303,18 +1358,22 @@ def delete_all_test_events() -> int:
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🗓 <b>Nodkeys Calendar Bot v4.0</b>\n\n"
+        f"🗓 <b>Nodkeys Calendar Bot v{VERSION}</b>\n\n"
         "Перешлите мне любое сообщение, и я:\n"
         "• Проанализирую его с помощью AI (Claude)\n"
         "• Создам событие/задачу/памятку в Apple Calendar\n"
         "• Сохраню заметку в Apple Notes\n"
         "• Добавлю запись в дневник\n"
-        "• Ссылки автоматически станут задачами на просмотр\n\n"
+        "• Найду и отправлю книги на Kindle\n"
+        "• Сделаю X-Ray анализ книги\n"
+        "• Отправлю статью на Kindle\n\n"
         "<b>Команды:</b>\n"
         "/calendars — список календарей\n"
         "/today — события на сегодня\n"
+        "/week — события на неделю\n"
         "/delete <i>текст</i> — найти и удалить запись\n"
         "/book <i>название</i> — найти книгу\n"
+        "/xray <i>название</i> — X-Ray анализ книги\n"
         "/cleanup — удалить все тестовые записи бота\n"
         "/help — справка",
         parse_mode="HTML",
@@ -1341,9 +1400,17 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• «Запомни: пароль от WiFi — 12345» → 📝 заметка\n"
         "• «Сегодня понял что нужно больше отдыхать» → 📔 дневник\n"
         "• «https://habr.com/article/123» → ✅ задача на просмотр\n\n"
-        "<b>📚 Поиск книг:</b>\n"
+        "📚 <b>Поиск книг:</b>\n"
         "• «Найди книгу Мастер и Маргарита» → 📚 поиск + Kindle\n"
         "• «Хочу почитать Стивена Кинга» → 📚 поиск\n\n"
+        "🔬 <b>X-Ray анализ:</b>\n"
+        "• «Сделай x-ray по Войне и миру» → персонажи, темы, таймлайн\n"
+        "• /xray Мастер и Маргарита → структурированный анализ\n\n"
+        "🌐 <b>URL → Kindle:</b>\n"
+        "• «Отправь на киндл https://habr.com/article»\n"
+        "• «На читалку https://medium.com/post»\n\n"
+        "📎 <b>Kindle Clippings:</b>\n"
+        "• Отправьте файл My Clippings.txt → ключевые цитаты и выводы\n\n"
         "<b>🗑 Удаление:</b>\n"
         "• Ответьте на сообщение бота и напишите «удали»\n"
         "• /delete стоматолог — найдёт и удалит\n"
@@ -1467,6 +1534,430 @@ async def callback_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("🗑 ✅ Запись удалена!")
     else:
         await query.edit_message_text("❌ Не удалось удалить запись")
+
+
+# ──────────────────── X-Ray Book Analysis ────────────────────
+
+XRAY_PROMPT = """You are a literary analyst. Generate an X-Ray analysis for the book "{book_title}"{author_part}.
+
+{progress_instruction}
+
+Provide the analysis in Russian, using this EXACT structure:
+
+🔬 <b>X-Ray: {book_title}</b>{author_line}
+
+<b>📚 О книге:</b>
+(Краткое описание в 2-3 предложениях: жанр, год написания, контекст)
+
+<b>👥 Персонажи:</b>
+• <b>Имя</b> — краткое описание и роль
+(до 10 ключевых персонажей)
+
+<b>🎯 Главные темы:</b>
+• Тема — краткое описание
+(до 5 тем)
+
+<b>📍 Ключевые локации:</b>
+• Место — значение в сюжете
+(до 5 локаций)
+
+<b>📅 Таймлайн:</b>
+(Краткая хронология событий без спойлеров)
+
+<b>💡 Интересные факты:</b>
+• 2-3 факта о книге или авторе
+
+IMPORTANT:
+- Use HTML formatting (<b>, <i>, \u2022)
+- Keep it concise but informative
+- Answer in Russian
+- DO NOT use markdown, only HTML tags
+- Maximum 4000 characters total"""
+
+
+def generate_xray_analysis(book_title: str, author: str = "", progress_percent: int | None = None) -> str:
+    """Generate X-Ray analysis for a book using Claude."""
+    author_part = f" by {author}" if author else ""
+    author_line = f"\n✍️ {author}" if author else ""
+    
+    if progress_percent is not None and progress_percent < 100:
+        progress_instruction = (
+            f"The reader is at {progress_percent}% of the book. "
+            f"DO NOT reveal any plot points, twists, or character developments "
+            f"that happen after the {progress_percent}% mark. "
+            f"Mark the analysis as spoiler-free up to {progress_percent}%."
+        )
+    else:
+        progress_instruction = "The reader has finished the book. You may include full analysis."
+    
+    prompt = XRAY_PROMPT.format(
+        book_title=book_title,
+        author_part=author_part,
+        author_line=author_line,
+        progress_instruction=progress_instruction,
+    )
+    
+    try:
+        response = claude_client.messages.create(
+            model=CLAUDE_MODEL,
+            max_tokens=4096,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        result = response.content[0].text.strip()
+        # Ensure it starts with the emoji header
+        if not result.startswith("🔬"):
+            result = f"🔬 <b>X-Ray: {book_title}</b>{author_line}\n\n" + result
+        return result
+    except Exception as e:
+        logger.error("X-Ray Claude error: %s", e)
+        raise
+
+
+async def cmd_xray(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Generate X-Ray analysis for a book."""
+    query = " ".join(context.args) if context.args else ""
+    
+    if not query:
+        await update.message.reply_text(
+            "🔬 <b>X-Ray анализ книги</b>\n\n"
+            "Использование: /xray <i>название книги</i>\n"
+            "Пример: /xray Мастер и Маргарита\n\n"
+            "📝 Персонажи, темы, локации, таймлайн\n"
+            "🚫 Без спойлеров (можно указать % прочтения)",
+            parse_mode="HTML",
+        )
+        return
+    
+    thinking = await update.message.reply_text(f"🔬 Генерирую X-Ray анализ «{query}»...")
+    
+    try:
+        result = await asyncio.to_thread(generate_xray_analysis, query)
+        await thinking.edit_text(result, parse_mode="HTML")
+    except Exception as e:
+        logger.error("X-Ray command error: %s", e)
+        await thinking.edit_text(f"❌ Ошибка генерации X-Ray: {str(e)[:200]}")
+
+
+# ──────────────────── URL → Kindle (EPUB) ────────────────────
+
+def url_to_epub(url: str, title_hint: str = "") -> tuple[str | None, str]:
+    """Download a web article, clean it, and convert to EPUB.
+    Returns (epub_path, title) or (None, error_message)."""
+    from bs4 import BeautifulSoup
+    
+    tmp_dir = "/tmp/kindle_files"
+    os.makedirs(tmp_dir, exist_ok=True)
+    
+    try:
+        # Download the page
+        headers = {
+            "User-Agent": f"NodkeysBot/{VERSION}",
+            "Accept": "text/html,application/xhtml+xml",
+        }
+        req = Request(url, headers=headers)
+        with urlopen(req, timeout=30) as resp:
+            raw_html = resp.read()
+            # Detect encoding
+            content_type = resp.headers.get("Content-Type", "")
+            charset = "utf-8"
+            if "charset=" in content_type:
+                charset = content_type.split("charset=")[-1].strip()
+            html_text = raw_html.decode(charset, errors="replace")
+    except Exception as e:
+        logger.error("URL fetch error: %s", e)
+        return None, f"Ошибка загрузки: {e}"
+    
+    # Parse and clean HTML
+    soup = BeautifulSoup(html_text, "html.parser")
+    
+    # Extract title
+    page_title = title_hint
+    if not page_title:
+        if soup.title and soup.title.string:
+            page_title = soup.title.string.strip()
+        else:
+            page_title = get_url_domain(url)
+    
+    # Remove unwanted elements
+    for tag in soup.find_all(["script", "style", "nav", "footer", "header",
+                               "aside", "iframe", "noscript", "form",
+                               "button", "input", "select", "textarea"]):
+        tag.decompose()
+    
+    # Remove ad-related elements
+    for tag in soup.find_all(attrs={"class": re.compile(
+        r"(ad|ads|advert|banner|popup|modal|cookie|consent|sidebar|widget|share|social|comment)",
+        re.IGNORECASE
+    )}):
+        tag.decompose()
+    
+    # Try to find the main article content
+    article = (
+        soup.find("article") or
+        soup.find(attrs={"class": re.compile(r"(article|post|content|entry|story)", re.IGNORECASE)}) or
+        soup.find("main") or
+        soup.body
+    )
+    
+    if not article:
+        return None, "Не удалось извлечь контент страницы"
+    
+    # Build clean HTML for EPUB
+    clean_html = f"""<?xml version="1.0" encoding="utf-8"?>
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml">
+<head>
+<meta charset="utf-8"/>
+<title>{page_title}</title>
+<style>
+body {{ font-family: serif; line-height: 1.6; padding: 1em; }}
+h1, h2, h3 {{ margin-top: 1.5em; }}
+img {{ max-width: 100%; height: auto; }}
+blockquote {{ border-left: 3px solid #ccc; padding-left: 1em; margin-left: 0; color: #555; }}
+pre, code {{ font-family: monospace; font-size: 0.9em; background: #f5f5f5; padding: 0.2em; }}
+</style>
+</head>
+<body>
+<h1>{page_title}</h1>
+<p><small>Источник: {url}</small></p>
+<hr/>
+{article}
+</body>
+</html>"""
+    
+    # Save as HTML first
+    safe_name = re.sub(r'[^\w\s\-]', '', page_title)[:60].strip() or "article"
+    html_path = os.path.join(tmp_dir, f"{safe_name}.html")
+    epub_path = os.path.join(tmp_dir, f"{safe_name}.epub")
+    
+    with open(html_path, "w", encoding="utf-8") as f:
+        f.write(clean_html)
+    
+    # Convert to EPUB using Calibre
+    try:
+        from kindle_handler import convert_with_calibre
+        converted = convert_with_calibre(html_path, "epub")
+        if converted and os.path.exists(converted):
+            return converted, page_title
+    except ImportError:
+        pass
+    except Exception as e:
+        logger.warning("Calibre conversion failed: %s, trying direct EPUB", e)
+    
+    # Fallback: try ebook-convert directly
+    try:
+        import subprocess
+        result = subprocess.run(
+            ["ebook-convert", html_path, epub_path,
+             "--title", page_title,
+             "--authors", get_url_domain(url),
+             "--language", "ru"],
+            capture_output=True, text=True, timeout=60
+        )
+        if result.returncode == 0 and os.path.exists(epub_path):
+            return epub_path, page_title
+        logger.error("ebook-convert failed: %s", result.stderr[:200])
+    except FileNotFoundError:
+        logger.warning("ebook-convert not found, sending HTML directly")
+    except Exception as e:
+        logger.error("ebook-convert error: %s", e)
+    
+    # Last resort: send HTML file directly (Kindle supports HTML)
+    if os.path.exists(html_path):
+        return html_path, page_title
+    
+    return None, "Не удалось создать EPUB"
+
+
+async def callback_urlkindle(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle URL→Kindle device selection callback."""
+    query = update.callback_query
+    await query.answer()
+    
+    data = query.data
+    if not data.startswith("urlkindle:"):
+        return
+    
+    kindle_email = data[10:]  # Remove "urlkindle:" prefix
+    
+    if kindle_email == "cancel":
+        await query.edit_message_text("❌ Отправка отменена.")
+        context.user_data.pop("url_kindle_pending", None)
+        return
+    
+    pending = context.user_data.get("url_kindle_pending")
+    if not pending:
+        await query.edit_message_text("⚠️ Данные не найдены. Попробуйте заново.")
+        return
+    
+    epub_path = pending["epub_path"]
+    article_title = pending["title"]
+    article_url = pending["url"]
+    
+    # Find device name
+    device_name = kindle_email
+    try:
+        from kindle_handler import get_kindle_devices
+        for name, email in get_kindle_devices():
+            if email == kindle_email:
+                device_name = name
+                break
+    except ImportError:
+        pass
+    
+    await query.edit_message_text(
+        f"📧 Отправлю на {device_name}...\n\n"
+        f"📖 <b>{article_title}</b>",
+        parse_mode="HTML",
+    )
+    
+    try:
+        from kindle_handler import send_email_to_kindle, add_book_to_history, store_book_file, get_books_history
+        
+        subject = article_title
+        success, error_msg = send_email_to_kindle(epub_path, kindle_email, subject)
+        
+        if success:
+            # Store in history
+            try:
+                book_id_num = len(get_books_history()) + 1
+            except Exception:
+                book_id_num = 1
+            
+            stored_file = store_book_file(epub_path, book_id_num)
+            
+            from pathlib import Path as _P
+            add_book_to_history(
+                filename=os.path.basename(epub_path),
+                title=article_title,
+                author=get_url_domain(article_url),
+                format_from="HTML",
+                format_to=_P(epub_path).suffix.upper().lstrip("."),
+                kindle_email=kindle_email,
+                converted=True,
+                file_size=os.path.getsize(epub_path),
+                stored_file=stored_file,
+            )
+            
+            await query.edit_message_text(
+                f"✅ <b>Статья отправлена на {device_name}!</b>\n\n"
+                f"📖 <b>{article_title}</b>\n"
+                f"🔗 <code>{article_url[:60]}</code>\n"
+                f"📤 Формат: {_P(epub_path).suffix.upper()}\n\n"
+                f"📬 <i>Статья появится на {device_name} через 1-5 минут</i>",
+                parse_mode="HTML",
+            )
+        else:
+            await query.edit_message_text(
+                f"❌ <b>Ошибка отправки</b>\n\n{error_msg}",
+                parse_mode="HTML",
+            )
+    except ImportError:
+        await query.edit_message_text("⚠️ Kindle handler недоступен.")
+    except Exception as e:
+        logger.error("URL Kindle send error: %s", e)
+        await query.edit_message_text(f"❌ <b>Ошибка:</b> {str(e)[:200]}", parse_mode="HTML")
+    finally:
+        context.user_data.pop("url_kindle_pending", None)
+        # Cleanup temp files
+        try:
+            tmp_dir = "/tmp/kindle_files"
+            for f in os.listdir(tmp_dir):
+                fp = os.path.join(tmp_dir, f)
+                if os.path.isfile(fp):
+                    os.remove(fp)
+        except Exception:
+            pass
+
+
+# ──────────────────── Kindle Clippings Parser ────────────────────
+
+def parse_kindle_clippings(text: str) -> dict[str, list[str]]:
+    """Parse Kindle 'My Clippings.txt' file into a dict of {book_title: [highlights]}."""
+    books = {}
+    entries = text.split("==========")
+    
+    for entry in entries:
+        entry = entry.strip()
+        if not entry:
+            continue
+        
+        lines = entry.split("\n")
+        if len(lines) < 3:
+            continue
+        
+        # First line is the book title (and author)
+        book_title = lines[0].strip()
+        # Remove BOM if present
+        book_title = book_title.lstrip("\ufeff")
+        
+        # The highlight text is after the metadata line and empty line
+        highlight_lines = []
+        found_empty = False
+        for line in lines[1:]:
+            if not found_empty and line.strip() == "":
+                found_empty = True
+                continue
+            if found_empty and line.strip():
+                highlight_lines.append(line.strip())
+        
+        highlight = " ".join(highlight_lines).strip()
+        if highlight and book_title:
+            if book_title not in books:
+                books[book_title] = []
+            # Avoid duplicates
+            if highlight not in books[book_title]:
+                books[book_title].append(highlight)
+    
+    return books
+
+
+def summarize_clippings_with_ai(books: dict[str, list[str]]) -> str:
+    """Use Claude to generate key takeaways from Kindle clippings."""
+    # Build a compact representation
+    parts = []
+    total_highlights = 0
+    for title, highlights in sorted(books.items(), key=lambda x: -len(x[1])):
+        parts.append(f"\n### {title} ({len(highlights)} цитат)")
+        for h in highlights[:20]:  # Limit per book to avoid token overflow
+            parts.append(f"- {h[:300]}")
+        total_highlights += len(highlights)
+    
+    clippings_text = "\n".join(parts)
+    
+    prompt = f"""Analyze these Kindle highlights/clippings from the user's reading.
+Total: {total_highlights} highlights from {len(books)} books.
+
+{clippings_text}
+
+Generate a structured analysis in Russian using HTML formatting:
+
+1. For each book with 3+ highlights, provide:
+   - Book title
+   - Key Takeaways (2-3 main insights from the highlights)
+   - Best Quote (the most impactful highlight)
+
+2. At the end, provide:
+   - Overall reading themes/patterns
+   - Action Items (practical things to do based on the highlights)
+
+Use <b>, <i>, \u2022 for formatting. Keep it concise. Max 4000 chars.
+Start with: 📚 <b>Kindle Clippings Анализ</b>"""
+    
+    try:
+        response = claude_client.messages.create(
+            model=CLAUDE_MODEL,
+            max_tokens=4096,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        return response.content[0].text.strip()
+    except Exception as e:
+        logger.error("Clippings AI error: %s", e)
+        # Fallback: just list the books and counts
+        result = "📚 <b>Kindle Clippings</b>\n\n"
+        for title, highlights in sorted(books.items(), key=lambda x: -len(x[1])):
+            result += f"\u2022 <b>{title}</b> — {len(highlights)} цитат\n"
+        return result
 
 
 # ──────────────────── Book Search Command ────────────────────
@@ -1605,7 +2096,6 @@ async def callback_book(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     # Save to temp file
-    import tempfile
     tmp_dir = "/tmp/kindle_files"
     os.makedirs(tmp_dir, exist_ok=True)
     tmp_path = os.path.join(tmp_dir, filename)
@@ -1931,7 +2421,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context_parts = []
     forward_origin = getattr(msg, 'forward_origin', None)
     if forward_origin:
-        origin_type = getattr(forward_origin, 'type', '')
         if hasattr(forward_origin, 'sender_user') and forward_origin.sender_user:
             context_parts.append(f"Переслано от: {forward_origin.sender_user.first_name}")
         if hasattr(forward_origin, 'chat') and forward_origin.chat:
@@ -2045,7 +2534,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         search_author = data.get("author")  # May be None
         search_queries = data.get("search_queries", [search_query])
         send_to_kindle = data.get("send_to_kindle", False)
-        search_title = data.get("title", f"\u041f\u043e\u0438\u0441\u043a: {search_query}")
         
         logger.info("Book search: query='%s', author='%s', queries=%s, kindle=%s",
                     search_query, search_author, search_queries, send_to_kindle)
@@ -2220,6 +2708,107 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     
+    elif entry_type == "xray":
+        # X-Ray book analysis
+        book_title = data.get("book_title", "")
+        xray_author = data.get("author", "")
+        progress = data.get("progress_percent")
+        
+        if not book_title:
+            await thinking_msg.edit_text(
+                "❌ Не удалось определить название книги.\n"
+                "💡 Попробуйте: /xray Мастер и Маргарита"
+            )
+            return
+        
+        await thinking_msg.edit_text(
+            f"🔬 Генерирую X-Ray анализ...\n\n"
+            f"📖 <b>{book_title}</b>"
+            + (f"\n✍️ {xray_author}" if xray_author else ""),
+            parse_mode="HTML",
+        )
+        
+        try:
+            xray_result = await asyncio.to_thread(
+                generate_xray_analysis, book_title, xray_author, progress
+            )
+            await thinking_msg.edit_text(xray_result, parse_mode="HTML")
+        except Exception as e:
+            logger.error("X-Ray generation error: %s", e)
+            await thinking_msg.edit_text(f"❌ Ошибка генерации X-Ray: {str(e)[:200]}")
+        return
+    
+    elif entry_type == "url_to_kindle":
+        # URL → Kindle
+        article_url = data.get("url", "")
+        article_title = data.get("title", "")
+        
+        if not article_url:
+            # Try to extract URL from original text
+            found_urls = extract_urls(text)
+            if found_urls:
+                article_url = found_urls[0]
+            else:
+                await thinking_msg.edit_text(
+                    "❌ Не найдена ссылка для отправки на Kindle.\n"
+                    "💡 Отправьте ссылку с пометкой «на киндл»"
+                )
+                return
+        
+        await thinking_msg.edit_text(
+            f"🌐 Скачиваю статью...\n\n"
+            f"🔗 <code>{article_url[:80]}</code>",
+            parse_mode="HTML",
+        )
+        
+        try:
+            epub_path, final_title = await asyncio.to_thread(
+                url_to_epub, article_url, article_title
+            )
+        except Exception as e:
+            logger.error("URL to EPUB error: %s", e)
+            await thinking_msg.edit_text(
+                f"❌ Не удалось скачать статью.\n\n{str(e)[:200]}"
+            )
+            return
+        
+        if not epub_path:
+            await thinking_msg.edit_text(
+                "❌ Не удалось сконвертировать статью в EPUB."
+            )
+            return
+        
+        # Show device selection
+        try:
+            from kindle_handler import get_kindle_devices
+            devices = get_kindle_devices()
+        except ImportError:
+            devices = [("Kindle", os.getenv("KINDLE_EMAIL", ""))]
+        
+        context.user_data["url_kindle_pending"] = {
+            "epub_path": epub_path,
+            "title": final_title,
+            "url": article_url,
+        }
+        
+        keyboard = []
+        for name, email in devices:
+            keyboard.append([InlineKeyboardButton(
+                f"📱 {name}",
+                callback_data=f"urlkindle:{email}"
+            )])
+        keyboard.append([InlineKeyboardButton("❌ Отмена", callback_data="urlkindle:cancel")])
+        
+        await thinking_msg.edit_text(
+            f"🌐 <b>Статья готова к отправке!</b>\n\n"
+            f"📖 <b>{final_title}</b>\n"
+            f"🔗 <code>{article_url[:60]}</code>\n\n"
+            f"📱 <b>Отправить на:</b>",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
+        return
+    
     else:
         # Calendar event (event/task/reminder)
         logger.info("Creating calendar event: %s", data.get('title', '?'))
@@ -2313,7 +2902,7 @@ class HealthHandler(BaseHTTPRequestHandler):
                 kindle_stats = {}
             data = {
                 "status": "ok",
-                "bot": "Nodkeys Calendar & Life Bot v4.1",
+                "bot": f"Nodkeys Calendar & Life Bot v{VERSION}",
                 "uptime_seconds": int(uptime),
                 "messages_processed": _messages_processed,
                 **kindle_stats,
@@ -2416,8 +3005,8 @@ h3 { margin: 4px 8px 8px; color: #4ade80; font-size: 14px; border-bottom: 1px so
                 self.wfile.write(f'<html><body style="background:#1a1c2e;color:#e0e0e0;font-family:sans-serif;padding:20px">Error: {e}</body></html>'.encode())
         elif self.path == '/kindle':
             try:
-                from kindle_handler import get_book_history
-                books = get_book_history()
+                from kindle_handler import get_books_history
+                books = get_books_history()
                 html = '''<!DOCTYPE html>
 <html><head><meta charset="utf-8">
 <meta http-equiv="refresh" content="60">
@@ -2461,7 +3050,10 @@ h3 { margin: 4px 8px 8px; color: #4ade80; font-size: 14px; border-bottom: 1px so
                 self.wfile.write(f'<html><body style="background:#1a1c2e;color:#e0e0e0;font-family:sans-serif;padding:20px">Error: {e}</body></html>'.encode())
         elif self.path.startswith('/download/'):
             try:
-                filename = self.path[len('/download/'):]
+                filename = os.path.basename(self.path[len('/download/'):])
+                # Prevent path traversal
+                if '..' in filename or '/' in filename:
+                    raise ValueError('Invalid filename')
                 from kindle_handler import BOOKS_STORAGE_DIR
                 file_path = os.path.join(BOOKS_STORAGE_DIR, filename)
                 if os.path.exists(file_path) and os.path.isfile(file_path):
@@ -2485,8 +3077,8 @@ h3 { margin: 4px 8px 8px; color: #4ade80; font-size: 14px; border-bottom: 1px so
                 self.wfile.write(f'<html><body style="background:#1a1c2e;color:#e0e0e0;font-family:sans-serif;padding:20px">Error: {e}</body></html>'.encode())
         elif self.path == '/books':
             try:
-                from kindle_handler import get_book_history
-                books = get_book_history()
+                from kindle_handler import get_books_history
+                books = get_books_history()
                 total = len(books)
                 last_book = books[-1]["title"] if books else "No books yet"
                 last_sent = books[-1]["sent_at"] if books else "-"
@@ -2496,7 +3088,7 @@ h3 { margin: 4px 8px 8px; color: #4ade80; font-size: 14px; border-bottom: 1px so
                     "last_sent": last_sent,
                     "books": books,
                 }
-            except Exception as e:
+            except Exception:
                 data = {
                     "total_books": 0,
                     "last_book": "No books yet",
@@ -2541,7 +3133,7 @@ def main():
         logger.error("iCloud credentials not set!")
         sys.exit(1)
 
-    logger.info("Starting Nodkeys Calendar & Life Bot v4.1...")
+    logger.info("Starting Nodkeys Calendar & Life Bot v%s...", VERSION)
     logger.info("Bot token: ...%s", BOT_TOKEN[-10:])
     logger.info("iCloud user: %s", ICLOUD_USERNAME)
     logger.info("Claude model: %s", CLAUDE_MODEL)
@@ -2581,9 +3173,12 @@ def main():
     app.add_handler(CommandHandler("today", cmd_today))
     app.add_handler(CommandHandler("delete", cmd_delete))
     app.add_handler(CommandHandler("cleanup", cmd_cleanup))
+    app.add_handler(CommandHandler("book", cmd_book))
+    app.add_handler(CommandHandler("xray", cmd_xray))
     app.add_handler(CallbackQueryHandler(callback_delete, pattern=r"^del:"))
     app.add_handler(CallbackQueryHandler(callback_book, pattern=r"^book:"))
     app.add_handler(CallbackQueryHandler(callback_bookdev, pattern=r"^bookdev:"))
+    app.add_handler(CallbackQueryHandler(callback_urlkindle, pattern=r"^urlkindle:"))
 
     # Kindle handlers
     try:
