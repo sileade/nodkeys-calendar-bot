@@ -1,4 +1,4 @@
-# Nodkeys Calendar & Life Bot v5.0
+# Nodkeys Calendar & Life Bot v5.2
 
 A powerful, self-hosted Telegram bot that acts as a **unified personal assistant**. Write naturally in Telegram — the bot analyzes your message with **Claude AI** and automatically routes it to the right service: Apple Calendar, Apple Notes, diary, book search, X-Ray analysis, URL-to-Kindle, or Kindle delivery.
 
@@ -42,6 +42,8 @@ The bot uses **Claude AI** to understand the intent behind every message and rou
 | **Book Search** | "Find book Master and Margarita" | Flibusta/Anna's Archive/Jackett → Kindle |
 | **X-Ray** | "X-Ray по Мастеру и Маргарите" | AI literary analysis |
 | **URL → Kindle** | "На киндл https://habr.com/article" | Download → EPUB → Kindle |
+| **Recurring Tasks** | "Пить таблетки 3 раза в день неделю" | Series of Apple Calendar events |
+| **Photo Recognition** | Send photo of prescription/document | AI extracts tasks/reminders |
 
 ### Calendar Management (Apple Calendar via iCloud CalDAV)
 
@@ -109,6 +111,16 @@ Generate a structured literary analysis for any book, inspired by Amazon Kindle 
 | **Spoiler-Free** | Specify reading progress (%) to avoid spoilers |
 
 Usage: `/xray Мастер и Маргарита` or write "сделай x-ray по Войне и миру"
+
+### Recurring Tasks & Photo Recognition (NEW in v5.2)
+
+The bot now supports creating complex recurring tasks and extracting information from photos.
+
+| Feature | Description |
+| --- | --- |
+| **Recurring Tasks** | "Пить таблетки 3 раза в день неделю" creates a series of 21 calendar events |
+| **Photo Recognition** | Send a photo of a medical prescription or document, and Claude Vision will extract the tasks and create calendar entries |
+| **Smart Routing** | Recurring tasks respect per-user calendar routing rules in group chats |
 
 ### URL → Kindle (NEW in v5.0)
 
