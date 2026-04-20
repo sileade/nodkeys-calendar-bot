@@ -1051,9 +1051,9 @@ SYSTEM_PROMPT = """Ты — умный ассистент-планировщик
 }}
 
 Примеры анализа recurring_tasks:
-- "Пить таблетки глицина 3 раза в день неделю" → type: "recurring_tasks", tasks: [{title: "Пить глицин", times: ["09:00", "14:00", "21:00"], start_date: сегодня, end_date: +7 дней}]
-- "Принимать витамины утром и вечером 10 дней" → type: "recurring_tasks", tasks: [{title: "Витамины", times: ["08:00", "20:00"], start_date: сегодня, end_date: +10 дней}]
-- "Ежедневно зарядка в 7 утра месяц" → type: "recurring_tasks", tasks: [{title: "Зарядка", times: ["07:00"], start_date: сегодня, end_date: +30 дней}]
+- "Пить таблетки глицина 3 раза в день неделю" → type: "recurring_tasks", tasks: [{{title: "Пить глицин", times: ["09:00", "14:00", "21:00"], start_date: сегодня, end_date: +7 дней}}]
+- "Принимать витамины утром и вечером 10 дней" → type: "recurring_tasks", tasks: [{{title: "Витамины", times: ["08:00", "20:00"], start_date: сегодня, end_date: +10 дней}}]
+- "Ежедневно зарядка в 7 утра месяц" → type: "recurring_tasks", tasks: [{{title: "Зарядка", times: ["07:00"], start_date: сегодня, end_date: +30 дней}}]
 
 ВАЖНО для recurring_tasks:
 - Если есть слова "неделю", "каждый день", "ежедневно", "N раз в день", "курс", "на протяжении" — это RECURRING_TASKS, не обычный reminder!
