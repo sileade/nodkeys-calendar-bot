@@ -865,6 +865,7 @@ SYSTEM_PROMPT = """Ты — умный ассистент-планировщик
 - `book_search` — пользователь хочет найти книгу, скачать книгу, отправить книгу на Kindle
 - `xray` — пользователь хочет получить X-Ray анализ книги (персонажи, темы, таймлайн)
 - `url_to_kindle` — пользователь хочет отправить веб-статью/URL на Kindle
+- `recurring_tasks` — повторяющиеся задачи: курс лекарств, ежедневные действия на период, регулярные напоминания
 
 Запись НЕ нужна если:
 - Сообщение слишком абстрактное ("ок", "да", "понял")
@@ -944,6 +945,9 @@ SYSTEM_PROMPT = """Ты — умный ассистент-планировщик
 - "Найди книгу...", "Скачай...", "Хочу почитать...", "Отправь на Kindle..." → book_search
 - "Сделай x-ray", "Анализ персонажей", "О чём книга", "Темы книги" → xray
 - "Отправь статью на киндл", "На киндл [URL]", "Почитать на читалке [URL]" → url_to_kindle
+- Если есть ПОВТОРЯЮЩЕЕСЯ действие на период (лекарства, курс, ежедневно N раз в день, на неделю/месяц) → recurring_tasks
+- "Пить таблетки 3 раза в день 7 дней", "Принимать витамины неделю", "Курс лечения 10 дней" → recurring_tasks
+- "Ежедневно делать зарядку месяц", "Каждый день пить воду" → recurring_tasks
 
 ## Правила определения уверенности (confidence):
 - 0.95-1.0 — чёткая дата, время, конкретное действие
@@ -1022,6 +1026,41 @@ SYSTEM_PROMPT = """Ты — умный ассистент-планировщик
   "confidence": 0.95,
   "reasoning": "Пользователь просит отправить статью на Kindle"
 }}
+
+Для recurring_tasks (повторяющиеся задачи):
+{{
+  "action": "create_series",
+  "type": "recurring_tasks",
+  "summary": "Краткое описание",
+  "tasks": [
+    {{
+      "title": "Название задачи",
+      "description": "Подробности",
+      "calendar": "family",
+      "type": "reminder",
+      "start_date": "2026-04-20",
+      "end_date": "2026-04-27",
+      "times": ["10:00", "14:00", "18:00"],
+      "alarm_minutes": 0,
+      "repeat_daily": true
+    }}
+  ],
+  "one_time_events": [],
+  "confidence": 0.9,
+  "reasoning": "Анализ"
+}}
+
+Примеры анализа recurring_tasks:
+- "Пить таблетки глицина 3 раза в день неделю" → type: "recurring_tasks", tasks: [{title: "Пить глицин", times: ["09:00", "14:00", "21:00"], start_date: сегодня, end_date: +7 дней}]
+- "Принимать витамины утром и вечером 10 дней" → type: "recurring_tasks", tasks: [{title: "Витамины", times: ["08:00", "20:00"], start_date: сегодня, end_date: +10 дней}]
+- "Ежедневно зарядка в 7 утра месяц" → type: "recurring_tasks", tasks: [{title: "Зарядка", times: ["07:00"], start_date: сегодня, end_date: +30 дней}]
+
+ВАЖНО для recurring_tasks:
+- Если есть слова "неделю", "каждый день", "ежедневно", "N раз в день", "курс", "на протяжении" — это RECURRING_TASKS, не обычный reminder!
+- start_date = сегодня (если не указано иное)
+- end_date = start_date + период (неделя = +7, месяц = +30)
+- times = массив времён приёма (3 раза в день → ["09:00", "14:00", "21:00"], 2 раза → ["09:00", "21:00"])
+- Если указано конкретное время ("в 10 часов") — используй его как первый приём, остальные распредели равномерно
 
 Примеры анализа xray:
 - "Сделай x-ray по Войне и миру" → type: "xray", book_title: "Война и мир", author: "Толстой"
@@ -3258,6 +3297,80 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup(keyboard),
         )
+        return
+    
+    elif entry_type == "recurring_tasks":
+        # Create series of recurring calendar events
+        logger.info("Creating recurring tasks: %s", data.get('summary', '?'))
+        tasks = data.get("tasks", [])
+        one_time = data.get("one_time_events", [])
+        
+        if not tasks and not one_time:
+            await thinking_msg.edit_text("❌ Не удалось извлечь задачи из сообщения.")
+            return
+        
+        # Apply calendar override for user
+        cal_override = None
+        if user_routing and user_routing.get("calendar_rule") not in (None, "auto"):
+            cal_override = user_routing["calendar_rule"]
+        if cal_override:
+            for t in tasks:
+                t["calendar"] = cal_override
+            for e in one_time:
+                e["calendar"] = cal_override
+        
+        try:
+            recurring_uids = await asyncio.to_thread(
+                create_recurring_tasks, tasks, cal_override
+            )
+        except Exception as exc:
+            logger.error("create_recurring_tasks error: %s", exc)
+            recurring_uids = []
+        
+        # Create one-time events
+        one_time_uids = []
+        for evt in one_time:
+            try:
+                uid = await asyncio.to_thread(create_calendar_event, evt)
+                if uid:
+                    one_time_uids.append(uid)
+            except Exception as exc:
+                logger.error("one-time event error: %s", exc)
+        
+        total = len(recurring_uids) + len(one_time_uids)
+        summary = data.get("summary", "Задачи")
+        reasoning = data.get("reasoning", "")
+        
+        if total > 0:
+            # Build details
+            lines = [f"✅ <b>Создано {total} записей в Apple Calendar!</b>\n"]
+            lines.append(f"📝 <b>{summary}</b>\n")
+            
+            for t in tasks:
+                times_str = ", ".join(t.get("times", []))
+                lines.append(
+                    f"🔁 <b>{t.get('title', '?')}</b>\n"
+                    f"   📅 {t.get('start_date', '?')} — {t.get('end_date', '?')}\n"
+                    f"   ⏰ {times_str}\n"
+                    f"   🗓 Календарь: {t.get('calendar', '?')}"
+                )
+            
+            for evt in one_time:
+                lines.append(
+                    f"📌 <b>{evt.get('title', '?')}</b>\n"
+                    f"   📅 {evt.get('date', '?')} {evt.get('time_start', '')}"
+                )
+            
+            lines.append(f"\n💬 {reasoning[:300]}")
+            
+            await thinking_msg.edit_text(
+                "\n".join(lines),
+                parse_mode="HTML",
+            )
+        else:
+            await thinking_msg.edit_text(
+                f"❌ Не удалось создать записи.\n\n{reasoning[:300]}"
+            )
         return
     
     else:
