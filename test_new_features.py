@@ -146,7 +146,7 @@ print("\n📌 Test: VERSION constant")
 from bot import VERSION
 
 test("VERSION is defined", VERSION is not None)
-test("VERSION is 5.1", VERSION == "5.1", f"got '{VERSION}'")
+test("VERSION is 5.2", VERSION == "5.2", f"got '{VERSION}'")
 
 
 # ═══════════════════════════════════════════
@@ -215,7 +215,7 @@ test("User matched by ID", routing4 is not None and routing4["calendar_rule"] ==
 
 # Test unknown user
 routing5 = get_user_routing(MockUser(777, "stranger"))
-test("Unknown user returns None", routing5 is None)
+test("Unknown user defaults to family", routing5 is not None and routing5.get("calendar_rule") == "family", f"got {routing5}")
 
 # Test apply_calendar_override
 data_work = {"type": "event", "calendar": "work", "title": "Test"}

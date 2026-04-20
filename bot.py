@@ -13,7 +13,7 @@ Telegram bot that analyzes messages using Claude AI and routes them:
 - All through natural language — no commands needed
 """
 
-VERSION = "5.1"
+VERSION = "5.2"
 
 import os
 import re
@@ -51,7 +51,7 @@ from telegram.ext import (
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 CHAT_ID = int(os.environ.get("TELEGRAM_CHAT_ID", "0"))
 CLAUDE_API_KEY = os.environ.get("CLAUDE_API_KEY", "")
-CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-20250514")
+CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-6")
 
 # SOCKS5 proxy for Telegram API (e.g., ss-proxy:1080 in Docker network)
 TELEGRAM_PROXY_URL = os.environ.get("TELEGRAM_PROXY_URL", "")  # socks5://ss-proxy:1080
@@ -113,6 +113,10 @@ for _entry in _group_users_raw.split("|"):
 def get_user_routing(user) -> dict | None:
     """Get per-user routing config from GROUP_USERS.
     
+    Logic: if user is explicitly listed → use their rule.
+    If GROUP_USERS is configured but user is NOT listed → default to 'family'.
+    If GROUP_USERS is empty → return None (no routing override).
+    
     Args:
         user: telegram.User object (msg.from_user)
     Returns:
@@ -134,7 +138,10 @@ def get_user_routing(user) -> dict | None:
         name_key = user.first_name.lower()
         if name_key in GROUP_USERS:
             return GROUP_USERS[name_key]
-    return None
+    # User NOT in GROUP_USERS → default to family calendar
+    display = user.first_name or user.username or str(user.id)
+    logger.info("User '%s' not in GROUP_USERS → defaulting to family calendar", display)
+    return {"display_name": display, "calendar_rule": "family"}
 
 
 def apply_calendar_override(data: dict, user_routing: dict | None) -> dict:
@@ -514,28 +521,41 @@ def _search_flibusta_web(query: str, limit: int = 10) -> list[dict]:
             return results
         
         html = resp.text
-        # Find the books section - try multiple markers
+        
+        # Check for "nothing found" response first
+        if 'Ничего не найдено' in html:
+            logger.info("Flibusta web search '%s': nothing found (explicit)", query)
+            return results
+        
+        # Find the main content area (exclude sidebar)
+        # The main content is inside <div id="main"> or before <div id="sidebar">
+        sidebar_idx = html.find('id="sidebar')
+        if sidebar_idx > 0:
+            main_html = html[:sidebar_idx]
+        else:
+            main_html = html
+        
+        # Find the books section in main content only
         books_idx = -1
         for marker in ['Найденные книги', 'Найденных книг', 'найденные книги']:
-            books_idx = html.find(marker)
+            books_idx = main_html.find(marker)
             if books_idx >= 0:
                 break
         
         if books_idx < 0:
-            # Also try to find any <li> with /b/ links after the search form
-            form_idx = html.find('</form>')
-            if form_idx >= 0 and '/b/' in html[form_idx:]:
-                books_idx = form_idx
-                logger.info("Flibusta web search: found book links after form")
+            # Try to find <ul> with /b/ links in main content area
+            ul_idx = main_html.find('<ul>')
+            if ul_idx >= 0 and '/b/' in main_html[ul_idx:]:
+                books_idx = ul_idx
+                logger.info("Flibusta web search: found book list in main content")
             else:
                 logger.info("Flibusta web search: no books section found for '%s'", query)
                 return results
         
-        books_html = html[books_idx:]
+        books_html = main_html[books_idx:]
         
         # Parse book entries: <li><a href="/b/BOOK_ID">Title</a> - <a href="/a/AUTHOR_ID">Author</a></li>
-        # Titles may contain <span> tags for highlighting
-        # Extract each <li> block
+        # Titles may contain <b> tags for search term highlighting
         li_pattern = re.compile(r'<li>(.*?)</li>', re.DOTALL)
         book_id_pattern = re.compile(r'href="/b/(\d+)"')
         author_pattern = re.compile(r'href="/a/\d+">([^<]+)</a>')
@@ -1037,6 +1057,272 @@ WEEKDAYS_RU = {
     4: "Пятница", 5: "Суббота", 6: "Воскресенье"
 }
 
+# ══════════════════════════════════════════════════════════
+# ██  PHOTO / DOCUMENT RECOGNITION (Claude Vision)
+# ══════════════════════════════════════════════════════════
+
+PHOTO_ANALYSIS_PROMPT = """Ты — умный ассистент. Тебе отправили фотографию документа.
+Проанализируй изображение и извлеки ВСЮ полезную информацию.
+
+Текущая дата: {current_datetime}
+День недели: {weekday}
+Часовой пояс: Europe/Moscow
+
+## Типы документов и что извлекать:
+
+### Медицинские документы (рецепты, назначения, выписки):
+- Названия лекарств, дозировки, частота приёма, длительность курса
+- Даты приёма врача, следующего визита
+- Диагнозы, рекомендации
+
+### Билеты и бронирования:
+- Дата, время, место
+- Номер рейса/поезда/места
+- Название мероприятия
+
+### Расписания, графики:
+- Все даты и события
+- Время начала/окончания
+
+### Чеки, счета:
+- Сумма, дата, назначение платежа
+- Дедлайны оплаты
+
+### Другие документы:
+- Ключевая информация для запоминания
+- Даты, сроки, контакты
+
+## Формат ответа (строго JSON):
+
+Если найдены повторяющиеся задачи (лекарства, курс лечения и т.д.):
+{{
+  "action": "create_series",
+  "type": "recurring_tasks",
+  "document_type": "medical|ticket|schedule|receipt|other",
+  "summary": "Краткое описание документа",
+  "tasks": [
+    {{
+      "title": "Краткое название задачи",
+      "description": "Подробное описание",
+      "calendar": "family",
+      "type": "reminder",
+      "start_date": "2026-04-20",
+      "end_date": "2026-04-27",
+      "times": ["09:00", "21:00"],
+      "alarm_minutes": 15,
+      "repeat_daily": true
+    }}
+  ],
+  "one_time_events": [
+    {{
+      "title": "Визит к врачу",
+      "description": "Повторный приём",
+      "calendar": "family",
+      "type": "event",
+      "date": "2026-04-27",
+      "time_start": "10:00",
+      "time_end": "10:30",
+      "all_day": false,
+      "alarm_minutes": 60
+    }}
+  ],
+  "confidence": 0.9,
+  "reasoning": "Анализ документа"
+}}
+
+Если найдено одиночное событие/задача:
+{{
+  "action": "create",
+  "type": "event|task|reminder",
+  "document_type": "medical|ticket|schedule|receipt|other",
+  "summary": "Краткое описание документа",
+  "calendar": "family",
+  "title": "Название",
+  "description": "Описание",
+  "date": "2026-04-20",
+  "time_start": "14:00",
+  "time_end": "15:00",
+  "all_day": false,
+  "alarm_minutes": 30,
+  "confidence": 0.9,
+  "reasoning": "Анализ"
+}}
+
+Если документ содержит только информацию для заметки:
+{{
+  "action": "create",
+  "type": "note",
+  "document_type": "medical|ticket|schedule|receipt|other",
+  "summary": "Краткое описание документа",
+  "title": "Заголовок заметки",
+  "content": "Извлечённая информация",
+  "confidence": 0.9,
+  "reasoning": "Анализ"
+}}
+
+ВАЖНО:
+- Для лекарств: ОБЯЗАТЕЛЬНО создавай повторяющиеся задачи на КАЖДЫЙ день курса
+- Для "2 раза в день" — указывай times: ["09:00", "21:00"]
+- Для "3 раза в день" — times: ["08:00", "14:00", "20:00"]
+- Для "утром натощак" — times: ["07:30"]
+- alarm_minutes для лекарств = 5 (чтобы не пропустить)
+- Всегда ставь calendar: "family" для медицинских документов
+- Если длительность курса не указана, ставь 7 дней по умолчанию
+- Всегда отвечай ТОЛЬКО валидным JSON без markdown-обёртки."""
+
+
+def analyze_photo_with_claude(image_data: bytes, media_type: str = "image/jpeg",
+                               caption: str = "", sender_context: str = "") -> dict | None:
+    """Analyze a photo/document using Claude Vision API.
+    
+    Args:
+        image_data: Raw image bytes
+        media_type: MIME type (image/jpeg, image/png, etc.)
+        caption: Optional caption text from the user
+        sender_context: Context about the sender for calendar routing
+    
+    Returns:
+        Parsed JSON dict with analysis results, or None on error.
+    """
+    import base64
+    now = datetime.now(TIMEZONE)
+    weekday = WEEKDAYS_RU.get(now.weekday(), "")
+    
+    prompt = PHOTO_ANALYSIS_PROMPT.format(
+        current_datetime=now.strftime("%Y-%m-%d %H:%M"),
+        weekday=weekday,
+    )
+    if sender_context:
+        prompt += f"\n\n## Контекст отправителя\n{sender_context}"
+    
+    image_b64 = base64.b64encode(image_data).decode("utf-8")
+    
+    user_content = []
+    user_content.append({
+        "type": "image",
+        "source": {
+            "type": "base64",
+            "media_type": media_type,
+            "data": image_b64,
+        }
+    })
+    if caption:
+        user_content.append({
+            "type": "text",
+            "text": f"Подпись пользователя: {caption}"
+        })
+    else:
+        user_content.append({
+            "type": "text",
+            "text": "Проанализируй этот документ и создай соответствующие записи."
+        })
+    
+    for attempt in range(3):
+        try:
+            response = claude_client.messages.create(
+                model=CLAUDE_MODEL,
+                max_tokens=4096,
+                system=prompt,
+                messages=[{"role": "user", "content": user_content}],
+            )
+            raw = response.content[0].text.strip()
+            # Strip markdown code fences if present
+            if raw.startswith("```"):
+                raw = raw.split("\n", 1)[1]
+                if raw.endswith("```"):
+                    raw = raw[:-3]
+                raw = raw.strip()
+            data = json.loads(raw)
+            logger.info("Photo analysis (attempt %d): %s",
+                       attempt + 1, json.dumps(data, ensure_ascii=False)[:500])
+            return data
+        except json.JSONDecodeError as e:
+            logger.error("Photo analysis invalid JSON (attempt %d): %s — raw: %s",
+                        attempt + 1, e, raw[:500] if 'raw' in dir() else "N/A")
+            if attempt < 2:
+                continue
+            return None
+        except Exception as e:
+            logger.error("Photo analysis error (attempt %d): %s", attempt + 1, e)
+            if attempt < 2:
+                _time.sleep(2 ** attempt)
+                continue
+            return None
+    return None
+
+
+def create_recurring_tasks(tasks_data: list[dict], calendar_override: str | None = None) -> list[str]:
+    """Create a series of recurring calendar events from task definitions.
+    
+    Args:
+        tasks_data: List of task dicts with start_date, end_date, times, etc.
+        calendar_override: Force all tasks to this calendar (e.g. "family")
+    
+    Returns:
+        List of created event UIDs.
+    """
+    created_uids = []
+    
+    for task in tasks_data:
+        title = task.get("title", "Напоминание")
+        description = task.get("description", "")
+        cal_key = calendar_override or task.get("calendar", "family")
+        alarm_minutes = task.get("alarm_minutes", 5)
+        times = task.get("times", ["09:00"])
+        start_date_str = task.get("start_date", datetime.now(TIMEZONE).strftime("%Y-%m-%d"))
+        end_date_str = task.get("end_date")
+        
+        start_date = datetime.strptime(start_date_str, "%Y-%m-%d")
+        
+        if end_date_str:
+            end_date = datetime.strptime(end_date_str, "%Y-%m-%d")
+        else:
+            end_date = start_date + timedelta(days=6)  # Default 7 days
+        
+        current_date = start_date
+        day_count = 0
+        while current_date <= end_date:
+            date_str = current_date.strftime("%Y-%m-%d")
+            
+            for time_str in times:
+                event_data = {
+                    "calendar": cal_key,
+                    "title": title,
+                    "description": description,
+                    "date": date_str,
+                    "time_start": time_str,
+                    "all_day": False,
+                    "alarm_minutes": alarm_minutes,
+                    "type": "reminder",
+                }
+                
+                # Calculate time_end (15 min after start)
+                h, m = map(int, time_str.split(":"))
+                end_m = m + 15
+                end_h = h
+                if end_m >= 60:
+                    end_m -= 60
+                    end_h += 1
+                if end_h > 23:
+                    end_h = 23
+                event_data["time_end"] = f"{end_h:02d}:{end_m:02d}"
+                
+                uid = create_calendar_event(event_data)
+                if uid:
+                    created_uids.append(uid)
+            
+            current_date += timedelta(days=1)
+            day_count += 1
+            
+            # Safety limit: max 60 days
+            if day_count > 60:
+                logger.warning("Recurring task limit reached (60 days)")
+                break
+    
+    return created_uids
+
+
+
 
 def analyze_message(text: str, sender_context: str = "") -> dict | None:
     """Send message to Claude for analysis and return structured data.
@@ -1139,6 +1425,26 @@ def reset_caldav_client():
     global _caldav_client, _calendars
     _caldav_client = None
     _calendars = {}
+
+
+def _caldav_retry(func, *args, max_retries=2, **kwargs):
+    """Execute a CalDAV operation with automatic retry on connection errors."""
+    for attempt in range(max_retries + 1):
+        try:
+            return func(*args, **kwargs)
+        except Exception as e:
+            err_msg = str(e).lower()
+            is_conn_err = any(s in err_msg for s in [
+                "remote end closed", "connection reset", "broken pipe",
+                "timed out", "connection refused", "eof occurred",
+            ])
+            if is_conn_err and attempt < max_retries:
+                logger.warning("CalDAV retry (%d/%d): %s",
+                             attempt + 1, max_retries + 1, e)
+                reset_caldav_client()
+                _time.sleep(1 * (attempt + 1))
+                continue
+            raise
 
 
 def get_calendar(name: str) -> caldav.Calendar | None:
@@ -1332,11 +1638,10 @@ def search_events_by_title(query: str, days_range: int = 30) -> list[dict]:
 
 
 def get_today_events() -> list[dict]:
-    """Get all events for today."""
+    """Get all events for today (with CalDAV retry)."""
     results = []
     try:
-        client = get_caldav_client()
-        principal = client.principal()
+        principal = _caldav_retry(lambda: get_caldav_client().principal())
         today_start = datetime.now(TIMEZONE).replace(hour=0, minute=0, second=0, microsecond=0)
         today_end = today_start + timedelta(days=1)
         
@@ -1371,11 +1676,10 @@ def get_today_events() -> list[dict]:
 
 
 def get_week_events() -> list[dict]:
-    """Get all events for the current week (Mon-Sun)."""
+    """Get all events for the current week (Mon-Sun) with CalDAV retry."""
     results = []
     try:
-        client = get_caldav_client()
-        principal = client.principal()
+        principal = _caldav_retry(lambda: get_caldav_client().principal())
         now = datetime.now(TIMEZONE)
         monday = now - timedelta(days=now.weekday())
         week_start = monday.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -1422,8 +1726,7 @@ def delete_all_test_events() -> int:
     """Delete all events created by the bot (with emoji prefixes)."""
     count = 0
     try:
-        client = get_caldav_client()
-        principal = client.principal()
+        principal = _caldav_retry(lambda: get_caldav_client().principal())
         now = datetime.now(TIMEZONE)
         start = now - timedelta(days=30)
         end = now + timedelta(days=365)
@@ -1454,6 +1757,7 @@ def delete_all_test_events() -> int:
 # ══════════════════════════════════════════════════════════
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logger.info("CMD /start from user %s (chat %s)", update.effective_user.username, update.effective_chat.id)
     await update.message.reply_text(
         f"🗓 <b>Nodkeys Calendar Bot v{VERSION}</b>\n\n"
         "Перешлите мне любое сообщение, и я:\n"
@@ -1478,6 +1782,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logger.info("CMD /help from user %s (chat %s)", update.effective_user.username, update.effective_chat.id)
     await update.message.reply_text(
         "📖 <b>Как пользоваться</b>\n\n"
         "1️⃣ Перешлите или напишите сообщение\n"
@@ -1506,6 +1811,10 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🌐 <b>URL → Kindle:</b>\n"
         "• «Отправь на киндл https://habr.com/article»\n"
         "• «На читалку https://medium.com/post»\n\n"
+        "📸 <b>Распознавание документов:</b>\n"
+        "• Фото рецепта → серия напоминаний о лекарствах\n"
+        "• Фото билета → событие в календаре\n"
+        "• Фото расписания → несколько событий\n\n"
         "📎 <b>Kindle Clippings:</b>\n"
         "• Отправьте файл My Clippings.txt → ключевые цитаты и выводы\n\n"
         "<b>🗑 Удаление:</b>\n"
@@ -1529,6 +1838,7 @@ def _list_calendars() -> str:
 
 
 async def cmd_calendars(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logger.info("CMD /calendars from user %s", update.effective_user.username)
     try:
         text = await asyncio.to_thread(_list_calendars)
         await update.message.reply_text(text, parse_mode="HTML")
@@ -1538,6 +1848,7 @@ async def cmd_calendars(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logger.info("CMD /today from user %s", update.effective_user.username)
     events = await asyncio.to_thread(get_today_events)
     today = datetime.now(TIMEZONE).strftime("%d.%m.%Y")
     
@@ -1557,6 +1868,7 @@ async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Search and delete events by keyword."""
+    logger.info("CMD /delete from user %s, args=%s", update.effective_user.username, context.args)
     query = " ".join(context.args) if context.args else ""
     
     if not query:
@@ -1605,6 +1917,7 @@ async def cmd_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_cleanup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Delete all bot-created events."""
+    logger.info("CMD /cleanup from user %s", update.effective_user.username)
     thinking = await update.message.reply_text("🧹 Удаляю все тестовые записи бота...")
     count = await asyncio.to_thread(delete_all_test_events)
     await thinking.edit_text(
@@ -1712,6 +2025,7 @@ def generate_xray_analysis(book_title: str, author: str = "", progress_percent: 
 
 async def cmd_xray(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Generate X-Ray analysis for a book."""
+    logger.info("CMD /xray from user %s, args=%s", update.effective_user.username, context.args)
     query = " ".join(context.args) if context.args else ""
     
     if not query:
@@ -2061,6 +2375,7 @@ Start with: 📚 <b>Kindle Clippings Анализ</b>"""
 
 async def cmd_book(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Search for books on Flibusta and offer to send to Kindle."""
+    logger.info("CMD /book from user %s, args=%s", update.effective_user.username, context.args)
     query = " ".join(context.args) if context.args else ""
     
     if not query:
@@ -3258,6 +3573,238 @@ def start_health_server(port=8085):
 # ██  MAIN
 # ══════════════════════════════════════════════════════════
 
+
+# ──────────────────── PHOTO / DOCUMENT HANDLER ────────────────────
+
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle photos sent to the bot — analyze documents via Claude Vision."""
+    if not update.message or not update.message.photo:
+        return
+    
+    # Authorization check
+    chat_id = update.message.chat_id
+    user_id = update.message.from_user.id if update.message.from_user else None
+    
+    if ALLOWED_CHAT_IDS:
+        if chat_id not in ALLOWED_CHAT_IDS and user_id not in ALLOWED_CHAT_IDS:
+            if chat_id != CHAT_ID:
+                return
+    elif chat_id != CHAT_ID:
+        return
+    
+    # Get the highest resolution photo
+    photo = update.message.photo[-1]
+    caption = update.message.caption or ""
+    
+    # Determine sender context for calendar routing
+    sender_context = ""
+    user = update.message.from_user
+    if user:
+        routing = get_user_routing(user)
+        if routing:
+            sender_context = (
+                f"Отправитель: {routing['display_name']} "
+                f"(calendar_rule={routing['calendar_rule']})"
+            )
+        else:
+            sender_context = f"Отправитель: {user.first_name or user.username or 'Unknown'}"
+    
+    thinking = await update.message.reply_text(
+        "📸 <b>Анализирую фото документа...</b>\n"
+        "🔍 Распознаю текст и извлекаю данные...",
+        parse_mode="HTML",
+    )
+    
+    try:
+        # Download photo
+        tg_file = await context.bot.get_file(photo.file_id)
+        image_bytes = await tg_file.download_as_bytearray()
+        
+        # Determine media type
+        media_type = "image/jpeg"  # Telegram photos are always JPEG
+        
+        # Analyze with Claude Vision
+        data = await asyncio.to_thread(
+            analyze_photo_with_claude,
+            bytes(image_bytes), media_type, caption, sender_context
+        )
+        
+        if not data:
+            await thinking.edit_text(
+                "❌ Не удалось проанализировать фото.\n"
+                "Попробуйте отправить более чёткое изображение.",
+            )
+            return
+        
+        action = data.get("action", "skip")
+        doc_type = data.get("document_type", "other")
+        summary = data.get("summary", "")
+        
+        doc_type_emoji = {
+            "medical": "🏥", "ticket": "🎫", "schedule": "📋",
+            "receipt": "🧾", "other": "📄",
+        }
+        doc_emoji = doc_type_emoji.get(doc_type, "📄")
+        
+        # Apply calendar override for non-@seleadi users
+        calendar_override = None
+        if user:
+            routing = get_user_routing(user)
+            if routing and routing["calendar_rule"] != "auto":
+                calendar_override = routing["calendar_rule"]
+        
+        if action == "create_series":
+            # Recurring tasks (medications, courses, etc.)
+            tasks = data.get("tasks", [])
+            one_time = data.get("one_time_events", [])
+            
+            await thinking.edit_text(
+                f"{doc_emoji} <b>Документ распознан!</b>\n\n"
+                f"📋 {summary}\n\n"
+                f"⏳ Создаю {len(tasks)} серий напоминаний"
+                f"{' и ' + str(len(one_time)) + ' событий' if one_time else ''}...",
+                parse_mode="HTML",
+            )
+            
+            # Create recurring tasks
+            recurring_uids = await asyncio.to_thread(
+                create_recurring_tasks, tasks, calendar_override
+            )
+            
+            # Create one-time events
+            onetime_uids = []
+            for evt in one_time:
+                if calendar_override:
+                    evt["calendar"] = calendar_override
+                uid = await asyncio.to_thread(create_calendar_event, evt)
+                if uid:
+                    onetime_uids.append(uid)
+            
+            # Build response
+            total_created = len(recurring_uids) + len(onetime_uids)
+            
+            response = f"{doc_emoji} <b>Документ обработан!</b>\n\n"
+            response += f"📋 <b>{summary}</b>\n\n"
+            
+            if recurring_uids:
+                response += f"🔔 <b>Создано напоминаний:</b> {len(recurring_uids)}\n"
+                for task in tasks:
+                    times_str = ", ".join(task.get("times", []))
+                    response += (
+                        f"  • {task.get('title', '?')} "
+                        f"({task.get('start_date', '?')} — {task.get('end_date', '?')}, "
+                        f"{times_str})\n"
+                    )
+            
+            if onetime_uids:
+                response += f"\n📅 <b>Создано событий:</b> {len(onetime_uids)}\n"
+                for evt in one_time:
+                    time_info = ""
+                    if evt.get("time_start"):
+                        time_info = f" в {evt['time_start']}"
+                    response += f"  • {evt.get('title', '?')} — {evt.get('date', '?')}{time_info}\n"
+            
+            if not total_created:
+                response += "\n⚠️ Не удалось создать записи в календаре."
+            
+            confidence = data.get("confidence", 0)
+            conf_emoji = "🟢" if confidence >= 0.8 else "🟡" if confidence >= 0.5 else "🔴"
+            response += f"\n{conf_emoji} Уверенность: {confidence:.0%}"
+            
+            await thinking.edit_text(response, parse_mode="HTML")
+        
+        elif action == "create":
+            entry_type = data.get("type", "note")
+            
+            if calendar_override and entry_type in ("event", "task", "reminder"):
+                data["calendar"] = calendar_override
+            
+            if entry_type in ("event", "task", "reminder"):
+                uid = await asyncio.to_thread(create_calendar_event, data)
+                
+                if uid:
+                    type_map = {"event": "📅 Событие", "task": "✅ Задача", "reminder": "🔔 Напоминание"}
+                    cal_map = {"work": "💼 Рабочий", "family": "🏠 Семейный", "reminders": "⚠️ Напоминания"}
+                    
+                    entry_label = type_map.get(entry_type, entry_type)
+                    cal_name = cal_map.get(data.get("calendar", ""), data.get("calendar", ""))
+                    date_str = data.get("date", "?")
+                    time_str = ""
+                    if data.get("time_start") and not data.get("all_day"):
+                        time_str = f" в {data['time_start']}"
+                    
+                    response = (
+                        f"{doc_emoji} <b>Документ → {entry_label}</b>\n\n"
+                        f"📋 {summary}\n\n"
+                        f"📌 <b>{data.get('title', '?')}</b>\n"
+                        f"📅 {date_str}{time_str}\n"
+                        f"📂 {cal_name}\n"
+                    )
+                    if data.get("description"):
+                        response += f"📝 {data['description'][:200]}\n"
+                    
+                    confidence = data.get("confidence", 0)
+                    conf_emoji = "🟢" if confidence >= 0.8 else "🟡" if confidence >= 0.5 else "🔴"
+                    response += f"\n{conf_emoji} Уверенность: {confidence:.0%}"
+                    
+                    await thinking.edit_text(response, parse_mode="HTML")
+                else:
+                    await thinking.edit_text(
+                        f"{doc_emoji} <b>Документ распознан</b>\n\n"
+                        f"📋 {summary}\n\n"
+                        f"❌ Не удалось создать запись в календаре."
+                    )
+            
+            elif entry_type == "note":
+                # Save as Apple Note
+                note_title = data.get("title", "Документ")
+                note_content = data.get("content", summary)
+                
+                try:
+                    create_apple_note(note_title, f"<p>{note_content}</p>")
+                    response = (
+                        f"{doc_emoji} <b>Документ → 📝 Заметка</b>\n\n"
+                        f"📋 {summary}\n\n"
+                        f"📝 <b>{note_title}</b>\n"
+                        f"{note_content[:300]}"
+                    )
+                    await thinking.edit_text(response, parse_mode="HTML")
+                except Exception as e:
+                    logger.error("Save note from photo error: %s", e)
+                    await thinking.edit_text(
+                        f"{doc_emoji} <b>Документ распознан</b>\n\n"
+                        f"📋 {summary}\n\n"
+                        f"📝 <b>{note_title}</b>\n"
+                        f"{note_content[:300]}\n\n"
+                        f"⚠️ Не удалось сохранить в Apple Notes: {str(e)[:100]}"
+                    )
+            else:
+                await thinking.edit_text(
+                    f"{doc_emoji} <b>Документ распознан</b>\n\n"
+                    f"📋 {summary}\n\n"
+                    f"{data.get('reasoning', '')}"
+                )
+        
+        elif action == "skip":
+            await thinking.edit_text(
+                f"📸 <b>Фото проанализировано</b>\n\n"
+                f"{data.get('reasoning', 'Не удалось извлечь полезную информацию.')}"
+            )
+        
+        else:
+            await thinking.edit_text(
+                f"📸 <b>Фото проанализировано</b>\n\n"
+                f"📋 {summary}\n\n"
+                f"ℹ️ {data.get('reasoning', 'Неизвестный тип действия.')}"
+            )
+    
+    except Exception as e:
+        logger.error("Photo handler error: %s", e)
+        await thinking.edit_text(
+            f"❌ Ошибка обработки фото: {str(e)[:200]}"
+        )
+
+
 def main():
     if not BOT_TOKEN:
         logger.error("TELEGRAM_BOT_TOKEN not set!")
@@ -3330,6 +3877,9 @@ def main():
     except ImportError as e:
         logger.warning("Kindle handler not available: %s", e)
 
+    # Photo/document recognition handler
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_error_handler(error_handler)
 
