@@ -77,10 +77,11 @@ def escape_ical_text(text):
     """Escape text for iCal format per RFC 5545."""
     if not text:
         return ""
-    # Replace actual newlines with \n
+    # Escape backslashes first (before any other replacements that introduce backslashes)
+    text = text.replace("\\", "\\\\")
+    # Replace actual newlines with literal \n
     text = text.replace("\r\n", "\\n").replace("\r", "\\n").replace("\n", "\\n")
-    # BUG-13: Always escape semicolons and commas properly
-    text = text.replace("\\", "\\\\")  # Escape backslashes first
+    # Escape semicolons and commas per RFC 5545
     text = text.replace(";", "\\;")
     text = text.replace(",", "\\,")
     return text

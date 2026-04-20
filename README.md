@@ -20,6 +20,8 @@ You write in Telegram
 │  "Find book Master & Margarita"   │ → 📚 Flibusta → Kindle
 │  "X-Ray по Войне и миру"         │ → 🔬 AI literary analysis
 │  "На киндл https://habr.com/..."  │ → 🌐 URL → EPUB → Kindle
+│  "Пить таблетки 3 раза в день"    │ → 🔁 Series of calendar events
+│  📸 Photo of prescription         │ → 🏥 AI extracts → Calendar
 │  sent_file.epub                   │ → 📖 Convert → Kindle
 │  My Clippings.txt                 │ → 📎 AI analysis of highlights
 │  https://habr.com/article/123     │ → 🔗 Calendar (review task)
@@ -58,7 +60,7 @@ The bot uses **Claude AI** to understand the intent behind every message and rou
 | **Delete/Cleanup** | Reply "delete" to remove, or use `/delete` command |
 | **iCal Proxy** | Built-in proxy server for Homepage calendar widget |
 
-### Group Chat & Per-User Calendar Routing (NEW in v5.1)
+### Group Chat & Per-User Calendar Routing
 
 The bot supports **group chats** with per-user calendar routing. Each group member can have their own routing rule:
 
@@ -75,6 +77,18 @@ GROUP_USERS=vera_username:Вера:family|seleadi:Ilea:auto
 ```
 
 User matching supports: Telegram username, user ID, or first name (case-insensitive). The bot also sends sender context to Claude for better routing decisions in group chats.
+
+### Recurring Tasks & Photo Recognition
+
+The bot supports creating complex recurring task series and extracting actionable information from photos of documents.
+
+| Feature | Description |
+| --- | --- |
+| **Recurring Tasks** | "Пить таблетки 3 раза в день неделю" creates a series of 21 calendar events |
+| **Medication Courses** | "Курс антибиотиков 5 дней по 2 раза" generates all events with correct times |
+| **Photo Recognition** | Send a photo of a medical prescription, and Claude Vision extracts tasks and creates calendar entries |
+| **Smart Time Slots** | AI distributes times across the day (e.g., 3x/day → 10:00, 14:00, 18:00) |
+| **Per-User Routing** | Recurring tasks respect per-user calendar routing rules in group chats |
 
 ### Apple Notes Integration (via iCloud IMAP)
 
@@ -97,7 +111,7 @@ User matching supports: Telegram username, user ID, or first name (case-insensit
 | **Kindle Delivery** | Downloads, converts if needed, and sends to Kindle |
 | **Interactive** | Inline buttons for book selection and Kindle device selection |
 
-### X-Ray Book Analysis (NEW in v5.0)
+### X-Ray Book Analysis
 
 Generate a structured literary analysis for any book, inspired by Amazon Kindle X-Ray.
 
@@ -112,17 +126,7 @@ Generate a structured literary analysis for any book, inspired by Amazon Kindle 
 
 Usage: `/xray Мастер и Маргарита` or write "сделай x-ray по Войне и миру"
 
-### Recurring Tasks & Photo Recognition (NEW in v5.2)
-
-The bot now supports creating complex recurring tasks and extracting information from photos.
-
-| Feature | Description |
-| --- | --- |
-| **Recurring Tasks** | "Пить таблетки 3 раза в день неделю" creates a series of 21 calendar events |
-| **Photo Recognition** | Send a photo of a medical prescription or document, and Claude Vision will extract the tasks and create calendar entries |
-| **Smart Routing** | Recurring tasks respect per-user calendar routing rules in group chats |
-
-### URL → Kindle (NEW in v5.0)
+### URL → Kindle
 
 Send any web article to your Kindle as a clean EPUB.
 
@@ -136,7 +140,7 @@ Send any web article to your Kindle as a clean EPUB.
 
 Usage: "Отправь на киндл https://habr.com/article/123" or "На читалку https://medium.com/post"
 
-### Kindle Clippings Analysis (NEW in v5.0)
+### Kindle Clippings Analysis
 
 Send your Kindle's `My Clippings.txt` file to get an AI-powered analysis of your highlights.
 
@@ -175,11 +179,16 @@ Telegram Bot (python-telegram-bot)
 ├── Per-User Calendar Routing (family/work/auto per user)
 ├── Claude AI Message Router
 │   ├── event/task/reminder → Apple Calendar (iCloud CalDAV)
+│   ├── recurring_tasks → Series of Apple Calendar events
 │   ├── note → Apple Notes (iCloud IMAP)
 │   ├── diary → Apple Notes Daily Diary (iCloud IMAP)
 │   ├── book_search → Flibusta OPDS → Kindle
 │   ├── xray → Claude AI Literary Analysis
 │   └── url_to_kindle → Download → EPUB → Kindle
+├── Claude Vision (Photo Recognition)
+│   ├── Medical prescriptions → Recurring tasks
+│   ├── Schedules/tickets → Calendar events
+│   └── Documents → Apple Notes
 ├── Kindle Handler (OpenAI + Calibre + SMTP)
 │   ├── AI Format Analysis (OpenAI GPT-4.1-nano)
 │   ├── Kindle Clippings Parser + AI Summary
@@ -188,11 +197,13 @@ Telegram Bot (python-telegram-bot)
 ├── Health Check Server (:8085)
 │   ├── /health — bot status and stats
 │   ├── /weekly — HTML weekly calendar
+│   ├── /kindle — HTML Kindle library
 │   ├── /books — JSON book history
 │   ├── /repos — GitHub repositories
 │   └── /download/<file> — download stored books
 └── iCal Proxy Server (:8086)
-    └── /calendar.ics — combined iCal feed
+    ├── /calendar.ics — combined iCal feed
+    └── /health — proxy status
 ```
 
 ## Quick Start
@@ -218,7 +229,7 @@ cp .env.example .env
 ### 3. Build and run
 
 ```shell
-docker build -t calendar-bot:v5.0 .
+docker build -t calendar-bot:v5.2 .
 docker run -d \
   --name calendar-bot \
   --restart unless-stopped \
@@ -226,7 +237,7 @@ docker run -d \
   -v ./data:/app/data \
   -p 8085:8085 \
   -p 8086:8086 \
-  calendar-bot:v5.0
+  calendar-bot:v5.2
 ```
 
 ## Configuration
@@ -293,6 +304,15 @@ KINDLE_DEVICES="My Kindle:email1@kindle.com|Family Kindle:email2@kindle.com"
 - "Finish project report by Friday" → creates task in Work calendar
 - "Don't forget to buy milk" → creates reminder
 
+**Recurring Tasks:**
+- "Пить таблетки глицина 3 раза в день неделю" → creates 21 events (7 days × 3 times)
+- "Курс антибиотиков 5 дней по 2 раза в день" → creates 10 events
+- "Каждый день делать зарядку в 7 утра 2 недели" → creates 14 morning events
+
+**Photo Recognition:**
+- Send photo of medical prescription → AI extracts medication schedule → creates recurring events
+- Send photo of event ticket → AI extracts date and venue → creates calendar event
+
 **Notes:**
 - "Remember: the WiFi password is SuperSecret123" → saves to Apple Notes
 - "Note: interesting article about AI at habr.com/123" → saves to Apple Notes
@@ -306,16 +326,16 @@ KINDLE_DEVICES="My Kindle:email1@kindle.com|Family Kindle:email2@kindle.com"
 - "I want to read something by Stephen King" → searches by author
 - "Download 1984 Orwell" → finds and sends to Kindle
 
-**X-Ray (NEW):**
+**X-Ray:**
 - `/xray Мастер и Маргарита` → characters, themes, locations, timeline
 - "Сделай x-ray по Войне и миру" → AI literary analysis
 - "X-ray 1984 Orwell, я на 50%" → spoiler-free analysis up to 50%
 
-**URL → Kindle (NEW):**
+**URL → Kindle:**
 - "Отправь на киндл https://habr.com/article/123" → downloads, cleans, sends as EPUB
 - "На читалку https://medium.com/post" → article to Kindle
 
-**Kindle Clippings (NEW):**
+**Kindle Clippings:**
 - Send `My Clippings.txt` file → AI-powered analysis of your highlights
 
 **Kindle:**
@@ -337,7 +357,7 @@ Response:
 ```json
 {
   "status": "ok",
-  "bot": "Nodkeys Calendar & Life Bot v5.0",
+  "bot": "Nodkeys Calendar & Life Bot v5.2",
   "uptime_seconds": 3600,
   "messages_processed": 42,
   "kindle_sent": 5,
@@ -352,7 +372,15 @@ Response:
 GET http://localhost:8085/weekly
 ```
 
-Returns HTML with the current week's events.
+Returns HTML with the current week's events, styled for dark-theme dashboard embedding.
+
+### Kindle Library
+
+```
+GET http://localhost:8085/kindle
+```
+
+Returns HTML with the last 20 books sent to Kindle, with download links.
 
 ### Book History
 
@@ -362,13 +390,29 @@ GET http://localhost:8085/books
 
 Returns JSON with sent books history.
 
+### GitHub Repos
+
+```
+GET http://localhost:8085/repos
+```
+
+Returns HTML with GitHub repositories (requires `GITHUB_TOKEN`).
+
+### Book Download
+
+```
+GET http://localhost:8085/download/<filename>
+```
+
+Downloads a stored book file. Path traversal is prevented via filename sanitization.
+
 ### iCal Proxy
 
 ```
 GET http://localhost:8086/calendar.ics
 ```
 
-Returns combined iCal feed from all configured calendars. Useful for Homepage dashboard widget integration.
+Returns combined iCal feed from all configured calendars (5-minute cache). Useful for Homepage dashboard widget integration.
 
 ## Homepage Integration
 
@@ -378,7 +422,7 @@ Add to your Homepage `services.yaml`:
 - Calendar Bot:
     icon: mdi-robot
     href: https://t.me/your_bot
-    description: AI Calendar & Life Bot v5.0
+    description: AI Calendar & Life Bot v5.2
     widget:
       type: customapi
       url: http://calendar-bot:8085/health
@@ -404,6 +448,7 @@ See [DEPLOY.md](DEPLOY.md) for detailed deployment instructions, rollback proced
 | Language | Python 3.12 |
 | Bot Framework | python-telegram-bot 22.x |
 | AI Router | Anthropic Claude (Sonnet) |
+| AI Vision | Anthropic Claude (photo recognition) |
 | Format AI | OpenAI GPT-4.1-nano |
 | Calendar | iCloud CalDAV |
 | Notes & Diary | iCloud IMAP (Apple Notes) |
@@ -414,6 +459,13 @@ See [DEPLOY.md](DEPLOY.md) for detailed deployment instructions, rollback proced
 | Container | Docker |
 
 ## Changelog
+
+### v5.2 (2026-04-20)
+- **Recurring Tasks** — natural language support for creating series of calendar events (e.g., "пить таблетки 3 раза в день неделю" creates 21 events); Claude returns structured JSON with tasks, times, and date ranges; `create_recurring_tasks` function generates individual CalDAV events
+- **Photo Recognition** — Claude Vision analyzes photos of medical prescriptions, tickets, schedules, and documents; extracts actionable data and creates calendar events or recurring task series automatically
+- **`recurring_tasks` Routing** — new entry type in Claude system prompt with JSON format, keyword-based routing ("неделю", "каждый день", "курс", "N раз в день"), and per-user calendar override support
+- **iCal Proxy Fix** — corrected `escape_ical_text` backslash escaping order (backslashes now escaped before newline replacement to prevent double-escaping)
+- **SYSTEM_PROMPT Fix** — escaped `{` and `}` in inline JSON examples to prevent `str.format()` KeyError on `{title}` placeholders
 
 ### v5.1 (2026-04-20)
 - **Per-User Calendar Routing** — group chat support with per-user routing rules: each member can have their calendar entries forced to a specific calendar (family/work) or let Claude decide (auto)
