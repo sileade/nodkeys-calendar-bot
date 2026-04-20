@@ -51,9 +51,28 @@ The bot uses **Claude AI** to understand the intent behind every message and rou
 | **Auto-detect** | Distinguishes between events, tasks, and reminders |
 | **URL Detection** | Automatically creates "Review" tasks for shared links |
 | **Multi-calendar** | Routes entries to Work, Family, or Reminders calendars |
+| **Per-User Routing** | In group chats, each user can have their own calendar routing rule |
 | **Smart Dates** | Understands "tomorrow", "next Friday", "in a week", etc. |
 | **Delete/Cleanup** | Reply "delete" to remove, or use `/delete` command |
 | **iCal Proxy** | Built-in proxy server for Homepage calendar widget |
+
+### Group Chat & Per-User Calendar Routing (NEW in v5.1)
+
+The bot supports **group chats** with per-user calendar routing. Each group member can have their own routing rule:
+
+| Rule | Behavior | Example |
+| --- | --- | --- |
+| `family` | All calendar entries forced to Family calendar | Vera → always Family |
+| `work` | All calendar entries forced to Work calendar | — |
+| `auto` | Claude AI decides based on content (default) | @seleadi → Work or Family |
+
+Configure via `GROUP_USERS` environment variable:
+
+```
+GROUP_USERS=vera_username:Вера:family|seleadi:Ilea:auto
+```
+
+User matching supports: Telegram username, user ID, or first name (case-insensitive). The bot also sends sender context to Claude for better routing decisions in group chats.
 
 ### Apple Notes Integration (via iCloud IMAP)
 
@@ -140,6 +159,8 @@ Send any ebook or document to the bot, and it will analyze the format, convert i
 
 ```
 Telegram Bot (python-telegram-bot)
+├── Multi-Chat Authorization (ALLOWED_CHAT_IDS + GROUP_USERS)
+├── Per-User Calendar Routing (family/work/auto per user)
 ├── Claude AI Message Router
 │   ├── event/task/reminder → Apple Calendar (iCloud CalDAV)
 │   ├── note → Apple Notes (iCloud IMAP)
@@ -203,7 +224,9 @@ docker run -d \
 | Variable | Description | Required |
 | --- | --- | :-: |
 | `TELEGRAM_BOT_TOKEN` | Telegram bot token from @BotFather | **Yes** |
-| `TELEGRAM_CHAT_ID` | Allowed Telegram chat ID | **Yes** |
+| `TELEGRAM_CHAT_ID` | Primary allowed Telegram chat ID | **Yes** |
+| `ALLOWED_CHAT_IDS` | Additional allowed chat IDs (comma-separated) | No |
+| `GROUP_USERS` | Per-user routing rules for group chats | No |
 | `TELEGRAM_PROXY_URL` | SOCKS5 proxy for Telegram API | No |
 | `TELEGRAM_BASE_URL` | Custom Telegram API base URL | No |
 | `CLAUDE_API_KEY` | Anthropic Claude API key | **Yes** |
@@ -379,6 +402,13 @@ See [DEPLOY.md](DEPLOY.md) for detailed deployment instructions, rollback proced
 | Container | Docker |
 
 ## Changelog
+
+### v5.1 (2026-04-20)
+- **Per-User Calendar Routing** — group chat support with per-user routing rules: each member can have their calendar entries forced to a specific calendar (family/work) or let Claude decide (auto)
+- **Multi-Chat Authorization** — `ALLOWED_CHAT_IDS` supports multiple chat IDs (personal + group chats); `GROUP_USERS` configures per-user routing with username/ID/name matching
+- **Sender Context for Claude** — Claude receives sender identity in group chats for better calendar routing decisions
+- **URL Task Routing** — auto-detected URL tasks now respect per-user calendar rules
+- **36 Unit Tests** — expanded test suite with routing tests (username match, case-insensitive, ID match, override logic)
 
 ### v5.0 (2026-04-17)
 - **X-Ray Book Analysis** — `/xray` command and natural language trigger for AI-powered literary analysis (characters, themes, locations, timeline, fun facts) with spoiler-free mode

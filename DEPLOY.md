@@ -1,15 +1,16 @@
-# Nodkeys Calendar Bot — Deploy & Rollback Guide v5.0
+# Nodkeys Calendar Bot — Deploy & Rollback Guide v5.1
 
 ## Pre-Deploy Checklist
 
-Before deploying v5.0, verify the following:
+Before deploying v5.1, verify the following:
 
 | Step | Command | Expected |
 |------|---------|----------|
-| Tests pass | `python3 test_new_features.py` | 24/24 passed |
+| Tests pass | `python3 test_new_features.py` | 36/36 passed |
 | Syntax check | `python3 -m pyflakes bot.py kindle_handler.py ical_proxy.py` | No output |
-| Docker build | `docker build -t calendar-bot:v5.0 .` | Success |
+| Docker build | `docker build -t calendar-bot:v5.1 .` | Success |
 | `.env` updated | Check new vars in `.env.example` | All present |
+| Group routing | Set `ALLOWED_CHAT_IDS` and `GROUP_USERS` in `.env` | Configured |
 
 ## Deploy Steps
 
@@ -43,8 +44,8 @@ scp bot.py kindle_handler.py ical_proxy.py requirements.txt \
 
 # Build new image
 cd /root/quick-arr-Stack/calendar-bot
-docker build -t calendar-bot:v5.0 .
-docker tag calendar-bot:v5.0 calendar-bot:latest
+docker build -t calendar-bot:v5.1 .
+docker tag calendar-bot:v5.1 calendar-bot:latest
 
 # Restart container
 docker compose down calendar-bot
@@ -61,7 +62,7 @@ docker logs -f --tail 50 calendar-bot
 curl http://localhost:8085/health
 
 # Expected response:
-# {"status": "ok", "version": "5.0", ...}
+# {"status": "ok", "version": "5.1", ...}
 
 # Check iCal proxy
 curl http://localhost:8086/ | head -5
@@ -121,16 +122,32 @@ docker build -t calendar-bot:latest .
 docker compose up -d calendar-bot
 ```
 
-## What Changed in v5.0
+## What Changed in v5.1
 
 ### New Features (safe — additive only)
 
 | Feature | Files Changed | Risk |
 |---------|--------------|------|
+| Per-user calendar routing | `bot.py` (config + handle_message) | Low — no-op when GROUP_USERS empty |
+| Multi-chat authorization | `bot.py` (ALLOWED_CHAT_IDS) | Low — backwards compatible |
+| Sender context for Claude | `bot.py` (analyze_message) | Low — optional prompt append |
 | X-Ray book analysis | `bot.py` (new function) | Low — isolated, uses Claude |
 | URL → Kindle | `bot.py` (new function) | Low — isolated, uses existing Kindle pipeline |
 | Kindle Clippings parser | `bot.py` + `kindle_handler.py` | Low — new handler in document flow |
 | `/xray` command | `bot.py` (handler registration) | Low — new command, no conflicts |
+
+### New Environment Variables
+
+| Variable | Purpose | Required |
+|----------|---------|----------|
+| `ALLOWED_CHAT_IDS` | Additional allowed chat IDs (comma-separated) | No |
+| `GROUP_USERS` | Per-user routing: `username:name:rule\|...` | No |
+
+**Example `.env` addition for group chat:**
+```
+ALLOWED_CHAT_IDS=-1001234567890
+GROUP_USERS=vera_username:Вера:family|seleadi:Ilea:auto
+```
 
 ### Bug Fixes (moderate risk)
 
@@ -155,7 +172,9 @@ docker compose up -d calendar-bot
 Check these within 15 minutes of deploy:
 
 1. **Health endpoint**: `curl http://localhost:8085/health` — should return `"status": "ok"`
-2. **Bot responds**: Send `/start` in Telegram — should show v5.0 features
+2. **Bot responds**: Send `/start` in Telegram — should show v5.1 features
+3. **Group routing**: Send message from Vera in group — should create event in Family calendar
+4. **Auto routing**: Send message from @seleadi in group — Claude should decide calendar
 3. **Calendar works**: Send a message like "Встреча завтра в 15:00" — should create event
 4. **Books work**: Send `/book Мастер и Маргарита` — should search Flibusta
 5. **X-Ray works**: Send `/xray 1984` — should generate analysis

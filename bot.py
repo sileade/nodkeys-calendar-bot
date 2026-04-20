@@ -13,7 +13,7 @@ Telegram bot that analyzes messages using Claude AI and routes them:
 - All through natural language — no commands needed
 """
 
-VERSION = "5.0"
+VERSION = "5.1"
 
 import os
 import re
@@ -70,6 +70,96 @@ CALENDAR_MAP = {
 }
 
 TIMEZONE = ZoneInfo(os.environ.get("TZ", "Europe/Moscow"))
+
+# ──────────────────── Multi-Chat & Per-User Routing ────────────────────
+# Comma-separated list of allowed chat IDs (personal + group chats)
+_allowed_ids_raw = os.environ.get("ALLOWED_CHAT_IDS", "")
+ALLOWED_CHAT_IDS: set[int] = set()
+if CHAT_ID:
+    ALLOWED_CHAT_IDS.add(CHAT_ID)
+for _cid in _allowed_ids_raw.split(","):
+    _cid = _cid.strip()
+    if _cid:
+        try:
+            ALLOWED_CHAT_IDS.add(int(_cid))
+        except ValueError:
+            pass
+
+# Per-user routing in group chats
+# Format: "username_or_id:display_name:calendar_rule|..."
+# calendar_rule: "family" (always family), "work" (always work), "auto" (Claude decides)
+# Example: "vera123:Вера:family|seleadi:Ilea:auto"
+_group_users_raw = os.environ.get("GROUP_USERS", "")
+GROUP_USERS: dict[str, dict] = {}  # key = username (lowercase) or str(user_id)
+for _entry in _group_users_raw.split("|"):
+    _entry = _entry.strip()
+    if not _entry:
+        continue
+    _parts = _entry.split(":")
+    if len(_parts) >= 3:
+        _key = _parts[0].strip().lower().lstrip("@")
+        GROUP_USERS[_key] = {
+            "display_name": _parts[1].strip(),
+            "calendar_rule": _parts[2].strip().lower(),  # family / work / auto
+        }
+    elif len(_parts) == 2:
+        _key = _parts[0].strip().lower().lstrip("@")
+        GROUP_USERS[_key] = {
+            "display_name": _parts[0].strip(),
+            "calendar_rule": _parts[1].strip().lower(),
+        }
+
+
+def get_user_routing(user) -> dict | None:
+    """Get per-user routing config from GROUP_USERS.
+    
+    Args:
+        user: telegram.User object (msg.from_user)
+    Returns:
+        dict with 'display_name' and 'calendar_rule', or None if not configured.
+    """
+    if not user or not GROUP_USERS:
+        return None
+    # Match by username (lowercase, without @)
+    if user.username:
+        key = user.username.lower()
+        if key in GROUP_USERS:
+            return GROUP_USERS[key]
+    # Match by user_id
+    uid_key = str(user.id)
+    if uid_key in GROUP_USERS:
+        return GROUP_USERS[uid_key]
+    # Match by first_name (fallback)
+    if user.first_name:
+        name_key = user.first_name.lower()
+        if name_key in GROUP_USERS:
+            return GROUP_USERS[name_key]
+    return None
+
+
+def apply_calendar_override(data: dict, user_routing: dict | None) -> dict:
+    """Override calendar in Claude's response based on per-user routing rules.
+    
+    Args:
+        data: Claude analysis result dict
+        user_routing: result from get_user_routing(), or None
+    Returns:
+        Modified data dict with calendar potentially overridden.
+    """
+    if not user_routing:
+        return data
+    rule = user_routing.get("calendar_rule", "auto")
+    if rule == "auto":
+        return data  # Claude decides
+    # Force calendar for this user
+    entry_type = data.get("type", "")
+    if entry_type in ("event", "task", "reminder"):
+        original_cal = data.get("calendar", "family")
+        data["calendar"] = rule
+        if original_cal != rule:
+            logger.info("Calendar override: %s → %s (user rule: %s)",
+                       original_cal, rule, user_routing.get("display_name", "?"))
+    return data
 
 # ──────────────────── Apple Notes IMAP Config ────────────────────
 IMAP_HOST = "imap.mail.me.com"
@@ -948,14 +1038,21 @@ WEEKDAYS_RU = {
 }
 
 
-def analyze_message(text: str) -> dict | None:
-    """Send message to Claude for analysis and return structured data."""
+def analyze_message(text: str, sender_context: str = "") -> dict | None:
+    """Send message to Claude for analysis and return structured data.
+    
+    Args:
+        text: Message text to analyze.
+        sender_context: Optional context about the message sender for calendar routing.
+    """
     now = datetime.now(TIMEZONE)
     weekday = WEEKDAYS_RU.get(now.weekday(), "")
     prompt = SYSTEM_PROMPT.format(
         current_datetime=now.strftime("%Y-%m-%d %H:%M"),
         weekday=weekday,
     )
+    if sender_context:
+        prompt += f"\n\n## Контекст отправителя\n{sender_context}"
 
     for attempt in range(3):
         try:
@@ -2338,9 +2435,22 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     chat_id = msg.chat_id
-    if CHAT_ID and chat_id != CHAT_ID and msg.chat.type != "private":
-        logger.debug("Skipping: wrong chat_id %s (expected %s)", chat_id, CHAT_ID)
+    # Authorization: allow if chat_id is in allowed list, or user is in GROUP_USERS
+    user_routing = get_user_routing(msg.from_user)
+    is_allowed_chat = (not ALLOWED_CHAT_IDS) or (chat_id in ALLOWED_CHAT_IDS)
+    is_allowed_user = user_routing is not None
+    is_private = msg.chat.type == "private"
+    
+    if not is_allowed_chat and not is_allowed_user and not is_private:
+        logger.debug("Skipping: unauthorized chat_id %s, user %s",
+                    chat_id, msg.from_user.username if msg.from_user else '?')
         return
+    
+    # Log user routing info for group chats
+    if user_routing:
+        logger.info("User routing: %s → calendar_rule=%s",
+                   user_routing.get('display_name', '?'),
+                   user_routing.get('calendar_rule', 'auto'))
 
     text = msg.text.strip()
     if not text or text.startswith("/"):
@@ -2385,11 +2495,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             date_label = "завтра"
         
         results = []
+        # Determine calendar for URL tasks based on user routing
+        url_calendar = "work"
+        if user_routing and user_routing.get("calendar_rule") != "auto":
+            url_calendar = user_routing["calendar_rule"]
+        
         for url in urls:
             domain = get_url_domain(url)
             data = {
                 "type": "task",
-                "calendar": "work",
+                "calendar": url_calendar,
                 "title": f"Просмотреть: {domain}",
                 "description": f"Ссылка для просмотра: {url}",
                 "date": task_date,
@@ -2412,7 +2527,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_msg = await msg.reply_text(response, parse_mode="HTML", disable_web_page_preview=True)
             
             for url, domain, uid, data in results:
-                _event_store[reply_msg.message_id] = {"uid": uid, "calendar": "work"}
+                _event_store[reply_msg.message_id] = {"uid": uid, "calendar": url_calendar}
                 _save_event_store()
             
             return
@@ -2432,11 +2547,29 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context_parts:
         full_text = "\n".join(context_parts) + "\n\nТекст сообщения:\n" + text
 
+    # Build sender context for Claude (helps with calendar routing in group chats)
+    sender_context = ""
+    if user_routing:
+        sender_name = user_routing.get("display_name", "")
+        cal_rule = user_routing.get("calendar_rule", "auto")
+        if cal_rule == "auto":
+            sender_context = (
+                f"Сообщение от пользователя: {sender_name}. "
+                f"Определи календарь на основе содержания: work для рабочих дел, family для семейных."
+            )
+        else:
+            sender_context = (
+                f"Сообщение от пользователя: {sender_name}. "
+                f"Все календарные записи этого пользователя идут в календарь: {cal_rule}."
+            )
+    elif msg.from_user and msg.chat.type != "private":
+        sender_context = f"Сообщение от пользователя: {msg.from_user.first_name or '?'}."
+
     thinking_msg = await msg.reply_text("🤔 Анализирую сообщение...")
 
     logger.info("Calling Claude API for analysis...")
     try:
-        data = await asyncio.to_thread(analyze_message, full_text)
+        data = await asyncio.to_thread(analyze_message, full_text, sender_context)
     except Exception as e:
         logger.error("analyze_message thread error: %s", e)
         data = None
@@ -2471,6 +2604,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     entry_type = data.get("type", "")
+    
+    # ── Apply per-user calendar override ──
+    data = apply_calendar_override(data, user_routing)
     
     # ── Route by type ──
     
@@ -3138,6 +3274,11 @@ def main():
     logger.info("iCloud user: %s", ICLOUD_USERNAME)
     logger.info("Claude model: %s", CLAUDE_MODEL)
     logger.info("Flibusta base URL: %s", FLIBUSTA_BASE_URL)
+    logger.info("Allowed chat IDs: %s", ALLOWED_CHAT_IDS or "any")
+    if GROUP_USERS:
+        for ukey, udata in GROUP_USERS.items():
+            logger.info("Group user: %s → %s (calendar: %s)",
+                       ukey, udata['display_name'], udata['calendar_rule'])
 
     # Start health check server
     start_health_server(8085)

@@ -146,7 +146,7 @@ print("\n📌 Test: VERSION constant")
 from bot import VERSION
 
 test("VERSION is defined", VERSION is not None)
-test("VERSION is 5.0", VERSION == "5.0", f"got '{VERSION}'")
+test("VERSION is 5.1", VERSION == "5.1", f"got '{VERSION}'")
 
 
 # ═══════════════════════════════════════════
@@ -162,7 +162,96 @@ test("Prompt contains book_search type", "book_search" in SYSTEM_PROMPT)
 
 
 # ═══════════════════════════════════════════
-# Test 6: ical_proxy.py structure
+# Test 6: Per-user routing
+# ═══════════════════════════════════════════
+print("\n👥 Test: Per-user routing")
+
+from bot import (
+    get_user_routing, apply_calendar_override,
+    GROUP_USERS, ALLOWED_CHAT_IDS
+)
+
+# Test GROUP_USERS parsing (env not set, should be empty)
+test("GROUP_USERS is dict", isinstance(GROUP_USERS, dict))
+test("ALLOWED_CHAT_IDS is set", isinstance(ALLOWED_CHAT_IDS, set))
+
+# Test get_user_routing with mock user
+class MockUser:
+    def __init__(self, user_id, username=None, first_name=None, is_bot=False):
+        self.id = user_id
+        self.username = username
+        self.first_name = first_name
+        self.is_bot = is_bot
+
+# With empty GROUP_USERS, should return None
+test("get_user_routing returns None when no config",
+     get_user_routing(MockUser(123, "testuser")) is None)
+
+# Simulate GROUP_USERS config
+import bot as bot_module
+original_group_users = bot_module.GROUP_USERS.copy()
+
+bot_module.GROUP_USERS = {
+    "vera": {"display_name": "Вера", "calendar_rule": "family"},
+    "seleadi": {"display_name": "Ilea", "calendar_rule": "auto"},
+    "12345": {"display_name": "TestByID", "calendar_rule": "work"},
+}
+
+# Test username match
+routing = get_user_routing(MockUser(999, "vera"))
+test("Vera matched by username", routing is not None and routing["calendar_rule"] == "family")
+
+# Test username case-insensitive
+routing2 = get_user_routing(MockUser(999, "Vera"))
+test("Vera matched case-insensitive", routing2 is not None and routing2["calendar_rule"] == "family")
+
+# Test @seleadi match
+routing3 = get_user_routing(MockUser(888, "seleadi"))
+test("@seleadi matched", routing3 is not None and routing3["calendar_rule"] == "auto")
+
+# Test user_id match
+routing4 = get_user_routing(MockUser(12345, "unknown"))
+test("User matched by ID", routing4 is not None and routing4["calendar_rule"] == "work")
+
+# Test unknown user
+routing5 = get_user_routing(MockUser(777, "stranger"))
+test("Unknown user returns None", routing5 is None)
+
+# Test apply_calendar_override
+data_work = {"type": "event", "calendar": "work", "title": "Test"}
+overridden = apply_calendar_override(
+    data_work.copy(),
+    {"display_name": "Вера", "calendar_rule": "family"}
+)
+test("Override work→family for Vera", overridden["calendar"] == "family")
+
+# Test auto rule doesn't override
+data_work2 = {"type": "task", "calendar": "work", "title": "Test"}
+not_overridden = apply_calendar_override(
+    data_work2.copy(),
+    {"display_name": "Ilea", "calendar_rule": "auto"}
+)
+test("Auto rule keeps Claude's choice", not_overridden["calendar"] == "work")
+
+# Test non-calendar types not affected
+data_note = {"type": "note", "calendar": "work", "title": "Test"}
+note_result = apply_calendar_override(
+    data_note.copy(),
+    {"display_name": "Вера", "calendar_rule": "family"}
+)
+test("Note type not overridden", note_result["calendar"] == "work")
+
+# Test None routing
+data_none = {"type": "event", "calendar": "work", "title": "Test"}
+none_result = apply_calendar_override(data_none.copy(), None)
+test("None routing keeps original", none_result["calendar"] == "work")
+
+# Restore original
+bot_module.GROUP_USERS = original_group_users
+
+
+# ═══════════════════════════════════════════
+# Test 7: ical_proxy.py structure
 # ═══════════════════════════════════════════
 print("\n📅 Test: ical_proxy.py")
 
