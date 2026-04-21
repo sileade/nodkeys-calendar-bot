@@ -2822,13 +2822,29 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_id = msg.reply_to_message.message_id
             if reply_id in _event_store:
                 ev_data = _event_store[reply_id]
-                success = await asyncio.to_thread(delete_event_by_uid, ev_data["uid"], ev_data.get("calendar"))
-                if success:
-                    await msg.reply_text("🗑 ✅ Запись удалена из календаря!")
+                # Support both single UID and multi-UID (recurring_tasks) entries
+                uids = ev_data.get("uids", [])
+                if not uids and ev_data.get("uid"):
+                    uids = [ev_data["uid"]]
+                cal_key = ev_data.get("calendar")
+                deleted = 0
+                failed = 0
+                for uid in uids:
+                    ok = await asyncio.to_thread(delete_event_by_uid, uid, cal_key)
+                    if ok:
+                        deleted += 1
+                    else:
+                        failed += 1
+                if deleted > 0:
+                    if len(uids) == 1:
+                        await msg.reply_text("🗑 ✅ Запись удалена из календаря!")
+                    else:
+                        fail_note = f" (не удалось: {failed})" if failed else ""
+                        await msg.reply_text(f"🗑 ✅ Удалено {deleted} из {len(uids)} записей!{fail_note}")
                     del _event_store[reply_id]
                     _save_event_store()
                 else:
-                    await msg.reply_text("❌ Не удалось удалить запись")
+                    await msg.reply_text("❌ Не удалось удалить записи")
             else:
                 await msg.reply_text(
                     "⚠️ Не могу найти связанную запись. "
@@ -3367,6 +3383,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "\n".join(lines),
                 parse_mode="HTML",
             )
+            
+            # Store all UIDs for reply-based deletion
+            all_uids = list(recurring_uids) + list(one_time_uids)
+            if all_uids:
+                _event_store[thinking_msg.message_id] = {
+                    "uids": all_uids,
+                    "calendar": cal_override or data.get("tasks", [{}])[0].get("calendar", "family"),
+                    "title": summary,
+                }
+                _save_event_store()
         else:
             await thinking_msg.edit_text(
                 f"❌ Не удалось создать записи.\n\n{reasoning[:300]}"
@@ -3825,6 +3851,16 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             response += f"\n{conf_emoji} Уверенность: {confidence:.0%}"
             
             await thinking.edit_text(response, parse_mode="HTML")
+            
+            # Store all UIDs for reply-based deletion
+            all_photo_uids = list(recurring_uids) + list(onetime_uids)
+            if all_photo_uids:
+                _event_store[thinking.message_id] = {
+                    "uids": all_photo_uids,
+                    "calendar": calendar_override or "family",
+                    "title": summary,
+                }
+                _save_event_store()
         
         elif action == "create":
             entry_type = data.get("type", "note")
@@ -3861,6 +3897,14 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     response += f"\n{conf_emoji} Уверенность: {confidence:.0%}"
                     
                     await thinking.edit_text(response, parse_mode="HTML")
+                    
+                    # Store UID for reply-based deletion
+                    _event_store[thinking.message_id] = {
+                        "uid": uid,
+                        "calendar": data.get("calendar", "family"),
+                        "title": data.get("title", ""),
+                    }
+                    _save_event_store()
                 else:
                     await thinking.edit_text(
                         f"{doc_emoji} <b>Документ распознан</b>\n\n"
