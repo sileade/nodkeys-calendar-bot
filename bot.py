@@ -1280,7 +1280,7 @@ async def audiobook_download_pipeline(
     logger.info("Audiobook cache result: %s files", len(cached_files) if cached_files else 0)
 
     if cached_files:
-        # Found in cache — send Mini App button
+        # Found in cache — send player button
         logger.info("Audiobook found in cache: %d files", len(cached_files))
         webapp_url = f"https://bot.nodkeys.com/audiobook/player?hash={info_hash}"
         download_url = f"https://bot.nodkeys.com/audiobook/download/{info_hash}"
@@ -1289,41 +1289,29 @@ async def audiobook_download_pipeline(
             total_size = sum(f['size'] for f in cached_files)
         except Exception as e:
             logger.error("Cache size calc error: %s, files sample: %s", e, cached_files[:2])
-        # WebApp buttons don't work with editMessageText (Button_type_invalid)
-        # Must use sendMessage instead
+        # Use URL buttons (WebApp buttons don't work in group chats)
         keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton(
                 "\U0001f3a7 Открыть плеер",
-                web_app=WebAppInfo(url=webapp_url),
+                url=webapp_url,
             )],
             [InlineKeyboardButton(
                 "\U0001f4e5 Скачать все файлы",
                 url=download_url,
             )],
         ])
-        # First update the old message to show completion
-        await _edit(f"\u2705 <b>Аудиокнига найдена в кэше!</b>\n\n\U0001f3a7 {title[:60]}")
-        # Then send new message with WebApp button
         try:
-            await bot.send_message(
-                chat_id=chat_id,
-                text=(
-                    f"\u2705 <b>Аудиокнига готова!</b>\n\n"
-                    f"\U0001f3a7 {title[:60]}\n"
-                    f"\U0001f4c1 {len(cached_files)} аудиофайлов ({_format_size(total_size)})\n\n"
-                    f"\U0001f4a1 Нажмите <b>\"Открыть плеер\"</b> для прослушивания прямо в Telegram."
-                ),
-                parse_mode="HTML",
+            await _edit(
+                f"\u2705 <b>Аудиокнига готова!</b>\n\n"
+                f"\U0001f3a7 {title[:60]}\n"
+                f"\U0001f4c1 {len(cached_files)} аудиофайлов ({_format_size(total_size)})\n\n"
+                f"\U0001f4a1 Нажмите <b>\"Открыть плеер\"</b> для прослушивания.",
                 reply_markup=keyboard,
             )
         except Exception as e:
-            logger.error("Failed to send Mini App button: %s", e)
-            # Fallback: send URL link instead of WebApp button
+            logger.error("Failed to send player button (cache): %s", e)
+            # Fallback: send as new message
             try:
-                fallback_kb = InlineKeyboardMarkup([
-                    [InlineKeyboardButton("\U0001f3a7 Открыть плеер", url=webapp_url)],
-                    [InlineKeyboardButton("\U0001f4e5 Скачать все файлы", url=download_url)],
-                ])
                 await bot.send_message(
                     chat_id=chat_id,
                     text=(
@@ -1333,7 +1321,7 @@ async def audiobook_download_pipeline(
                         f"\U0001f4a1 Нажмите <b>\"Открыть плеер\"</b> для прослушивания."
                     ),
                     parse_mode="HTML",
-                    reply_markup=fallback_kb,
+                    reply_markup=keyboard,
                 )
             except Exception as e2:
                 logger.error("Fallback send also failed: %s", e2)
@@ -1476,49 +1464,33 @@ async def audiobook_download_pipeline(
     _save_audiobook_cache(cache)
 
     # ── Step 5: Send Mini App button ──
-    logger.info("Pipeline step 5: sending Mini App button")
+    logger.info("Pipeline step 5: sending player button")
     webapp_url = f"https://bot.nodkeys.com/audiobook/player?hash={info_hash}"
     download_url = f"https://bot.nodkeys.com/audiobook/download/{info_hash}"
     total_uploaded_size = sum(f['size'] for f in uploaded)
-    # WebApp buttons don't work with editMessageText (Button_type_invalid)
-    # Must use sendMessage instead
+    # Use URL buttons (WebApp buttons don't work in group chats)
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton(
             "\U0001f3a7 Открыть плеер",
-            web_app=WebAppInfo(url=webapp_url),
+            url=webapp_url,
         )],
         [InlineKeyboardButton(
             "\U0001f4e5 Скачать все файлы",
             url=download_url,
         )],
     ])
-    # Update old message to show completion
-    await _edit(
-        f"\u2705 <b>Скачано и закэшировано!</b>\n\n"
-        f"\U0001f3a7 {title[:60]}\n"
-        f"\U0001f4c1 {len(uploaded)} файлов ({_format_size(total_uploaded_size)})"
-    )
-    # Send new message with WebApp button
     try:
-        await bot.send_message(
-            chat_id=chat_id,
-            text=(
-                f"\u2705 <b>Аудиокнига готова!</b>\n\n"
-                f"\U0001f3a7 {title[:60]}\n"
-                f"\U0001f4c1 {len(uploaded)} файлов ({_format_size(total_uploaded_size)})\n\n"
-                f"\U0001f4a1 Нажмите <b>\"Открыть плеер\"</b> для прослушивания прямо в Telegram."
-            ),
-            parse_mode="HTML",
+        await _edit(
+            f"\u2705 <b>Аудиокнига готова!</b>\n\n"
+            f"\U0001f3a7 {title[:60]}\n"
+            f"\U0001f4c1 {len(uploaded)} файлов ({_format_size(total_uploaded_size)})\n\n"
+            f"\U0001f4a1 Нажмите <b>\"Открыть плеер\"</b> для прослушивания.",
             reply_markup=keyboard,
         )
     except Exception as e:
-        logger.error("Step 5: Failed to send WebApp button: %s", e)
-        # Fallback: send URL link
+        logger.error("Step 5: Failed to send player button: %s", e)
+        # Fallback: send as new message
         try:
-            fallback_kb = InlineKeyboardMarkup([
-                [InlineKeyboardButton("\U0001f3a7 Открыть плеер", url=webapp_url)],
-                [InlineKeyboardButton("\U0001f4e5 Скачать все файлы", url=download_url)],
-            ])
             await bot.send_message(
                 chat_id=chat_id,
                 text=(
@@ -1528,7 +1500,7 @@ async def audiobook_download_pipeline(
                     f"\U0001f4a1 Нажмите <b>\"Открыть плеер\"</b> для прослушивания."
                 ),
                 parse_mode="HTML",
-                reply_markup=fallback_kb,
+                reply_markup=keyboard,
             )
         except Exception as e2:
             logger.error("Step 5 fallback also failed: %s", e2)
