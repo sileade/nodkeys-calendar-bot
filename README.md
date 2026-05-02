@@ -1,4 +1,4 @@
-# Nodkeys Calendar # Nodkeys Calendar & Life Bot v8.0 Life Bot v8.1
+# Nodkeys Calendar & Life Bot v8.2
 
 A personal AI-powered Telegram bot that serves as a unified life management hub. It uses **Claude AI with native Tool Calling** to understand natural language and automatically route requests to the right system: Apple Calendar, Apple Notes, book search, server management, expense tracking, and more.
 
