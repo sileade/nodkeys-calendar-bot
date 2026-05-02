@@ -14,7 +14,7 @@ Telegram bot that analyzes messages using Claude AI and routes them:
 - All through natural language — no commands needed
 """
 
-VERSION = "9.0"
+VERSION = "9.1"
 
 import os
 import re
@@ -6859,6 +6859,71 @@ def _add_memory_fact(fact: str):
         facts = facts[-100:]
     mem["facts"] = facts
     _save_memory(mem)
+
+
+def _get_memory_facts() -> list:
+    """Get memory facts as a list of strings."""
+    mem = _load_memory()
+    return mem.get("facts", [])
+
+
+# ══════════════════════════════════════════════════════════
+# ██  Knowledge Base (interaction history)
+# ══════════════════════════════════════════════════════════
+KNOWLEDGE_FILE = os.path.join(os.path.dirname(__file__), "data", "knowledge.json")
+
+
+def _load_knowledge() -> list:
+    """Load knowledge base: list of interaction entries."""
+    try:
+        with open(KNOWLEDGE_FILE, "r") as f:
+            return json.loads(f.read())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
+
+
+def _save_knowledge(data: list):
+    """Save knowledge base to disk."""
+    os.makedirs(os.path.dirname(KNOWLEDGE_FILE), exist_ok=True)
+    with open(KNOWLEDGE_FILE, "w") as f:
+        f.write(json.dumps(data, ensure_ascii=False, indent=2))
+
+
+def _add_knowledge_entry(user_message: str, key: str, tool_used: str, result: str, category: str = "general"):
+    """Add an interaction entry to the knowledge base."""
+    try:
+        kb = _load_knowledge()
+        entry = {
+            "timestamp": datetime.now(TIMEZONE).strftime("%Y-%m-%d %H:%M"),
+            "user_message": user_message[:200],
+            "key": key,
+            "tool_used": tool_used,
+            "result": result[:500],
+            "category": category,
+        }
+        kb.append(entry)
+        # Keep max 500 entries
+        if len(kb) > 500:
+            kb = kb[-500:]
+        _save_knowledge(kb)
+    except Exception as e:
+        logger.error("Failed to add knowledge entry: %s", e)
+
+
+def _search_knowledge(query: str, category: str = "all") -> list:
+    """Search knowledge base by query and optional category."""
+    kb = _load_knowledge()
+    query_lower = query.lower()
+    results = []
+    for entry in reversed(kb):  # newest first
+        if category != "all" and entry.get("category") != category:
+            continue
+        text = f"{entry.get('user_message', '')} {entry.get('result', '')} {entry.get('key', '')}".lower()
+        if query_lower in text:
+            results.append(entry)
+        if len(results) >= 20:
+            break
+    return results
 
 # ══════════════════════════════════════════════════════════
 # ██  Multi-step Dialog State
