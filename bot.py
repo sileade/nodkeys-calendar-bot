@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-Nodkeys Calendar & Life Bot v8.2
+Nodkeys Calendar & Life Bot v5.0
 Telegram bot that analyzes messages using Claude AI and routes them:
 - Events/Tasks/Reminders → Apple Calendar (iCloud CalDAV)
 - Notes → Apple Notes (iCloud IMAP)
 - Diary entries → Apple Notes diary with chronography (one note per day)
 - Book search → Flibusta OPDS + Anna's Archive + Jackett + AI Rethink
+- Audiobook search → RuTracker (auth + scraping + magnet links)
 - Kindle: AI format detection, Calibre conversion, SMTP delivery
 - X-Ray: AI-powered book analysis (characters, themes, timeline)
 - Kindle Clippings: parse My Clippings.txt → key takeaways
@@ -13,7 +14,7 @@ Telegram bot that analyzes messages using Claude AI and routes them:
 - All through natural language — no commands needed
 """
 
-VERSION = "8.0"
+VERSION = "9.0"
 
 import os
 import re
@@ -727,6 +728,36 @@ def search_annas_archive(query: str, limit: int = 10) -> list[dict]:
 JACKETT_URL = "http://jackett:9117"
 JACKETT_API_KEY = os.environ.get("JACKETT_API_KEY", "zudqeyrvgh880mqr2a9i68o5cb2r0gie")
 
+# ──────────────────── RUTRACKER AUDIOBOOK CONFIG ────────────────────
+RUTRACKER_BASE_URL = os.environ.get("RUTRACKER_BASE_URL", "https://rutracker.net/forum")
+RUTRACKER_LOGIN = os.environ.get("RUTRACKER_LOGIN", "ILEA112")
+RUTRACKER_PASSWORD = os.environ.get("RUTRACKER_PASSWORD", "2qAP4")
+
+# RuTracker audiobook forum IDs
+RUTRACKER_AUDIOBOOK_FORUMS = [
+    402,   # [Аудио] Русская литература
+    400,   # [Аудио] История, культурология, философия
+    399,   # Аудиокниги на русском (общий)
+    2387,  # [Аудио] Зарубежная фантастика, фэнтези, мистика, ужасы
+    2388,  # [Аудио] Детективы, Триллеры
+    2389,  # [Аудио] Современная проза
+    2327,  # [Аудио] Классика
+    661,   # [Аудио] Историческая проза
+    2325,  # [Аудио] Научная фантастика
+    2326,  # [Аудио] Приключения
+    2324,  # [Аудио] Юмор
+    530,   # Аудиокниги на английском
+    2391,  # Аудиокниги на других языках
+    148,   # Аудио (общий)
+    403,   # [Аудио] Зарубежная литература
+    716,   # [Аудио] Бизнес, саморазвитие
+    2165,  # [Аудио] Детская литература
+]
+
+# Persistent httpx client for RuTracker (with session cookies)
+_rt_client: _flib_httpx.Client | None = None
+_rt_logged_in = False
+
 def search_jackett_books(query: str, limit: int = 5) -> list[dict]:
     """Поиск книг через Jackett (RuTracker, RuTor и др.)."""
     results = []
@@ -750,6 +781,165 @@ def search_jackett_books(query: str, limit: int = 5) -> list[dict]:
     except Exception as e:
         logger.error("Jackett search error: %s", e)
     return results
+
+
+# ══════════════════════════════════════════════════════════
+# ██  RUTRACKER AUDIOBOOK SEARCH
+# ══════════════════════════════════════════════════════════
+
+def _ensure_rutracker_login() -> _flib_httpx.Client:
+    """Ensure we have an authenticated RuTracker session."""
+    global _rt_client, _rt_logged_in
+
+    if _rt_client is None:
+        _rt_client = _flib_httpx.Client(
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            },
+            follow_redirects=True,
+            timeout=20,
+        )
+
+    if not _rt_logged_in:
+        try:
+            resp = _rt_client.post(
+                f"{RUTRACKER_BASE_URL}/login.php",
+                data={
+                    "login_username": RUTRACKER_LOGIN,
+                    "login_password": RUTRACKER_PASSWORD,
+                    "login": "Вход",
+                },
+            )
+            cookies = dict(_rt_client.cookies)
+            if "bb_session" in cookies or "bb_data" in cookies or RUTRACKER_LOGIN.lower() in resp.text.lower():
+                _rt_logged_in = True
+                logger.info("RuTracker login successful")
+            else:
+                logger.warning("RuTracker login may have failed")
+        except Exception as e:
+            logger.error("RuTracker login error: %s", e)
+
+    return _rt_client
+
+
+def search_rutracker_audiobooks(query: str, limit: int = 10) -> list[dict]:
+    """Search for audiobooks on RuTracker.
+
+    Args:
+        query: Search query (book title, author, etc.)
+        limit: Maximum number of results
+
+    Returns:
+        List of dicts with keys: title, topic_id, url, size, seeds, forum, date, source
+    """
+    results = []
+
+    try:
+        client = _ensure_rutracker_login()
+
+        # Build forum filter
+        forum_params = "&".join([f"f[]={f}" for f in RUTRACKER_AUDIOBOOK_FORUMS])
+        search_url = f"{RUTRACKER_BASE_URL}/tracker.php?nm={quote(query)}&{forum_params}"
+
+        logger.info("RuTracker audiobook search: %s", query)
+        resp = client.get(search_url)
+
+        if resp.status_code != 200:
+            logger.error("RuTracker search failed: HTTP %d", resp.status_code)
+            return results
+
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(resp.text, "html.parser")
+        tbl = soup.select_one("#tor-tbl")
+        if not tbl:
+            logger.warning("RuTracker: no results table found")
+            return results
+
+        rows = tbl.select("tr")[1:]  # Skip header
+        logger.info("RuTracker: found %d raw results", len(rows))
+
+        for row in rows[:limit]:
+            tds = row.select("td")
+            if len(tds) < 8:
+                continue
+
+            try:
+                # td[3] = title with link (a.tLink)
+                title_link = tds[3].select_one("a.tLink")
+                if not title_link:
+                    continue
+
+                title = title_link.get_text(strip=True)
+                topic_id = title_link.get("data-topic_id", "")
+                if not topic_id:
+                    href = title_link.get("href", "")
+                    m = re.search(r"t=(\d+)", href)
+                    topic_id = m.group(1) if m else ""
+
+                if not topic_id:
+                    continue
+
+                # td[2] = forum name
+                forum_el = tds[2].select_one("a")
+                forum_name = forum_el.get_text(strip=True) if forum_el else "Аудио"
+
+                # td[5] = size (a.dl-stub)
+                size_el = tds[5].select_one("a.dl-stub")
+                size_text = size_el.get_text(strip=True).replace("↓", "").strip() if size_el else "N/A"
+
+                # td[6] = seeds (b.seedmed)
+                seeds_el = tds[6].select_one("b.seedmed")
+                seeds = int(seeds_el.get_text(strip=True)) if seeds_el else 0
+
+                # td[9] = date
+                date_text = tds[9].get_text(strip=True) if len(tds) > 9 else ""
+
+                results.append({
+                    "title": title,
+                    "topic_id": topic_id,
+                    "url": f"{RUTRACKER_BASE_URL}/viewtopic.php?t={topic_id}",
+                    "download_url": f"{RUTRACKER_BASE_URL}/dl.php?t={topic_id}",
+                    "size": size_text,
+                    "seeds": seeds,
+                    "forum": forum_name,
+                    "date": date_text,
+                    "source": "rutracker",
+                })
+            except Exception as e:
+                logger.warning("RuTracker parse row error: %s", e)
+                continue
+
+        # Sort by seeds (most seeded first)
+        results.sort(key=lambda x: x["seeds"], reverse=True)
+
+    except Exception as e:
+        logger.error("RuTracker search error: %s", e)
+
+    return results
+
+
+def get_audiobook_magnet(topic_id: str) -> str | None:
+    """Get magnet link from a RuTracker topic page."""
+    try:
+        client = _ensure_rutracker_login()
+        url = f"{RUTRACKER_BASE_URL}/viewtopic.php?t={topic_id}"
+        resp = client.get(url)
+
+        # Find magnet link in page
+        magnet_match = re.search(r'magnet:\?xt=urn:btih:[a-fA-F0-9]+[^"\'\'<>\s]*', resp.text)
+        if magnet_match:
+            return magnet_match.group(0)
+
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(resp.text, "html.parser")
+        magnet_el = soup.select_one("a[href^='magnet:']")
+        if magnet_el:
+            return magnet_el.get("href")
+
+        return None
+    except Exception as e:
+        logger.error("RuTracker magnet error: %s", e)
+        return None
 
 
 def download_book(book_id: int, fmt: str = "epub") -> tuple[bytes | None, str]:
@@ -1011,6 +1201,57 @@ CLAUDE_TOOLS = [
         }
     },
     {
+        "name": "create_project",
+        "description": "Create a new project for organizing tasks into a kanban board. Use when user wants to start a new project, plan something complex, or organize work.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Project name"},
+                "description": {"type": "string", "description": "Brief project description"},
+                "tasks": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "title": {"type": "string"},
+                            "priority": {"type": "string", "enum": ["high", "medium", "low"]}
+                        },
+                        "required": ["title"]
+                    },
+                    "description": "Initial tasks to add to the project"
+                }
+            },
+            "required": ["name"]
+        }
+    },
+    {
+        "name": "manage_project",
+        "description": "Manage project tasks: add task, move task between columns (todo/in_progress/done), delete task, or show kanban board. Use when user talks about project progress, completing tasks within a project, or wants to see project status.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "enum": ["add_task", "move_task", "delete_task", "show_board", "list_projects", "delete_project"], "description": "Action to perform"},
+                "project_name": {"type": "string", "description": "Project name (for context)"},
+                "task_title": {"type": "string", "description": "Task title (for add/move/delete)"},
+                "new_status": {"type": "string", "enum": ["todo", "in_progress", "done"], "description": "New status for move_task"},
+                "priority": {"type": "string", "enum": ["high", "medium", "low"], "description": "Task priority"}
+            },
+            "required": ["action"]
+        }
+    },
+    {
+        "name": "search_audiobook",
+        "description": "Search for an audiobook (аудиокнига) on RuTracker. Use when user wants to find, download, or listen to an audiobook. Returns results with magnet links for torrent download.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Search query — book title, author name, or both"},
+                "search_queries": {"type": "array", "items": {"type": "string"}, "description": "2-3 search variants: exact title, author + title, transliteration"}
+            },
+            "required": ["query", "search_queries"]
+        }
+    },
+    {
         "name": "search_book",
         "description": "Search for a book on Flibusta and optionally send to Kindle. Use when user wants to find/download/read a book.",
         "input_schema": {
@@ -1229,6 +1470,44 @@ CLAUDE_TOOLS = [
                 "category": {"type": "string", "description": "Filter by category (optional)"}
             },
             "required": ["period"]
+        }
+    },
+    {
+        "name": "add_income",
+        "description": "Record income/earnings. Use when user mentions receiving money, salary, freelance payment, gift, or any income.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "amount": {"type": "number", "description": "Amount in rubles"},
+                "category": {"type": "string", "enum": ["salary", "freelance", "investment", "gift", "refund", "other"], "description": "Income category"},
+                "description": {"type": "string", "description": "Income source description"},
+                "date": {"type": "string", "description": "Date (YYYY-MM-DD), defaults to today"}
+            },
+            "required": ["amount", "category", "description"]
+        }
+    },
+    {
+        "name": "set_budget",
+        "description": "Set a monthly budget limit for an expense category. Use when user wants to set spending limits, budget goals, or financial targets.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "category": {"type": "string", "enum": ["food", "transport", "housing", "utilities", "entertainment", "health", "clothing", "subscriptions", "education", "other"], "description": "Expense category"},
+                "monthly_limit": {"type": "number", "description": "Monthly budget limit in rubles"}
+            },
+            "required": ["category", "monthly_limit"]
+        }
+    },
+    {
+        "name": "finance_chart",
+        "description": "Generate a visual chart of expenses. Use when user asks for financial graphs, visual reports, or spending visualization.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "chart_type": {"type": "string", "enum": ["bar", "pie"], "description": "Chart type: bar (daily/monthly spending) or pie (by category)"},
+                "period": {"type": "string", "enum": ["month", "year"], "description": "Time period"}
+            },
+            "required": ["chart_type"]
         }
     },
     {
@@ -1562,9 +1841,11 @@ def analyze_message(text: str, sender_context: str = "") -> dict | None:
         pass
     
     # Add memory context
-    memory_ctx = _get_memory_context()
-    if memory_ctx:
-        prompt += memory_ctx
+    memory_facts = _get_memory_facts()
+    if memory_facts:
+        prompt += "\n\n## Что я знаю о пользователе:\n"
+        for fact in memory_facts[-20:]:
+            prompt += f"- {fact}\n"
     
     for attempt in range(3):
         try:
@@ -3004,6 +3285,76 @@ async def cmd_book(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def callback_audiobook(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle audiobook selection callback — get magnet link."""
+    query = update.callback_query
+    await query.answer()
+
+    data = query.data
+    if data == "abook:cancel":
+        await query.edit_message_text("❌ Поиск отменён")
+        context.user_data.pop("audiobook_search_results", None)
+        return
+
+    # Parse callback: abook:{index}:magnet
+    parts = data.split(":")
+    if len(parts) < 3:
+        await query.edit_message_text("❌ Ошибка данных")
+        return
+
+    try:
+        ab_idx = int(parts[1])
+    except (ValueError, IndexError):
+        await query.edit_message_text("❌ Ошибка данных")
+        return
+
+    results = context.user_data.get("audiobook_search_results", [])
+    if ab_idx >= len(results):
+        await query.edit_message_text("❌ Аудиокнига не найдена в результатах")
+        return
+
+    ab = results[ab_idx]
+
+    await query.edit_message_text(
+        f"\u23f3 Получаю ссылку...\n\n"
+        f"\U0001f3a7 <b>{ab['title'][:60]}</b>\n"
+        f"\U0001f4e6 {ab['size']} | \U0001f331 Seeds: {ab['seeds']}",
+        parse_mode="HTML",
+    )
+
+    # Get magnet link
+    try:
+        magnet = await asyncio.to_thread(get_audiobook_magnet, ab["topic_id"])
+    except Exception as e:
+        logger.error("Audiobook magnet error: %s", e)
+        magnet = None
+
+    if magnet:
+        text = (
+            f"\U0001f3a7 <b>{ab['title'][:60]}</b>\n\n"
+            f"\U0001f4e6 Размер: {ab['size']}\n"
+            f"\U0001f331 Seeds: {ab['seeds']}\n"
+            f"\U0001f4c1 Раздел: {ab['forum']}\n"
+            f"\U0001f4c5 Дата: {ab['date']}\n\n"
+            f"\U0001f517 <a href=\"{ab['url']}\">Страница раздачи</a>\n\n"
+            f"\U0001f9f2 <b>Magnet-ссылка:</b>\n"
+            f"<code>{magnet}</code>\n\n"
+            f"\U0001f4a1 Скопируйте magnet-ссылку и откройте в торрент-клиенте"
+        )
+        await query.edit_message_text(text, parse_mode="HTML")
+    else:
+        # Fallback: send direct link to topic
+        await query.edit_message_text(
+            f"\U0001f3a7 <b>{ab['title'][:60]}</b>\n\n"
+            f"\u26a0\ufe0f Magnet-ссылка не найдена\n\n"
+            f"\U0001f517 <a href=\"{ab['url']}\">Открыть на RuTracker</a>\n"
+            f"(скачайте .torrent файл вручную)",
+            parse_mode="HTML",
+        )
+
+    context.user_data.pop("audiobook_search_results", None)
+
+
 async def callback_book(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle book selection callback — download and send to Kindle."""
     query = update.callback_query
@@ -3384,44 +3735,62 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
             , parse_mode="HTML")
             return
         
-        # Voice: show transcription, then dispatch via Tool Calling
-        tool_name = data.get("tool_name", "")
-        tool_input = data.get("tool_input", {})
-        
-        if tool_name == "chat_response":
-            msg_text = tool_input.get("message", "Не удалось обработать")
+        if data.get("action") == "skip":
             await thinking.edit_text(
                 f"🎤 <b>Распознано:</b>\n<i>{transcribed_text[:300]}</i>\n\n"
-                f"💬 {msg_text}",
+                f"🤔 <b>Не создаю запись</b>\n💭 <i>{data.get('reasoning', '')}</i>",
                 parse_mode="HTML"
             )
             return
         
-        if tool_name == "ask_clarification":
-            question = tool_input.get("question", "Уточните запрос")
+        confidence_val = data.get("confidence", 0)
+        if confidence_val < 0.4:
             await thinking.edit_text(
                 f"🎤 <b>Распознано:</b>\n<i>{transcribed_text[:300]}</i>\n\n"
-                f"❓ {question}",
+                f"⚠️ Низкая уверенность ({confidence_val:.0%})",
                 parse_mode="HTML"
             )
             return
         
-        # ── Voice: dispatch all other tools via unified handler ──
-        if tool_name == "save_memory":
-            fact = tool_input.get("fact", "")
-            if fact:
-                await asyncio.to_thread(_add_memory_fact, fact)
-                await thinking.edit_text(
-                    f"🎤🧠 <b>Распознано и запомнил!</b>\n\n"
-                    f"<i>{transcribed_text[:200]}</i>\n\n"
-                    f"💾 {fact}",
-                    parse_mode="HTML"
+        entry_type = data.get("type", "")
+        data = apply_calendar_override(data, user_routing)
+        
+        # Add category tag for calendar events
+        if entry_type in ("event", "task", "reminder"):
+            category_key = data.get("category", "personal")
+            CATEGORY_TAG_MAP = {
+                "personal": "👤 [Личное]",
+                "home": "🏠 [Дом]",
+                "work": "💼 [Работа]",
+                "longterm": "🎯 [Долгосрочные]",
+            }
+            cat_tag = CATEGORY_TAG_MAP.get(category_key, "👤 [Личное]")
+            original_title = data.get("title", "")
+            if not any(tag in original_title for tag in ["[Личное]", "[Дом]", "[Работа]", "[Долгосрочные]"]):
+                data["title"] = f"{cat_tag} {original_title}"
+            
+            uid = await asyncio.to_thread(create_calendar_event, data)
+            if uid:
+                type_map = {"event": "📅 Событие", "task": "✅ Задача", "reminder": "🔔 Напоминание"}
+                cal_map = {"work": "💼 Рабочий", "family": "🏠 Семейный", "reminders": "⚠️ Напоминания"}
+                response_text = (
+                    f"🎤 <b>Голосовое → Календарь!</b>\n\n"
+                    f"<b>Текст:</b> <i>{transcribed_text[:200]}</i>\n\n"
+                    f"<b>Тип:</b> {type_map.get(entry_type, entry_type)}\n"
+                    f"<b>Название:</b> {data.get('title', '?')}\n"
+                    f"<b>Дата:</b> {data.get('date', '?')}\n"
+                    f"<b>Календарь:</b> {cal_map.get(data.get('calendar', ''), '')}\n"
+                    f"\n🗑 <i>Ответьте «удали» чтобы удалить</i>"
                 )
-            return
+                await thinking.edit_text(response_text, parse_mode="HTML")
+                _event_store[thinking.message_id] = {"uid": uid, "calendar": data.get("calendar", "reminders")}
+                _save_event_store()
+            else:
+                await thinking.edit_text("❌ Не удалось создать запись в календаре")
         
-        if tool_name == "create_note":
-            title = tool_input.get("title", "Заметка")
-            note_content = tool_input.get("content", transcribed_text)
+        elif entry_type == "note":
+            title = data.get("title", "Заметка")
+            note_content = data.get("content", data.get("description", transcribed_text))
             html_body = f"<html><head></head><body><div>{note_content.replace(chr(10), '<br>')}</div></body></html>"
             success = await asyncio.to_thread(create_apple_note, title, html_body)
             if success:
@@ -3433,10 +3802,9 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
             else:
                 await thinking.edit_text("❌ Не удалось создать заметку")
-            return
         
-        if tool_name == "create_diary_entry":
-            diary_content = tool_input.get("content", transcribed_text)
+        elif entry_type == "diary":
+            diary_content = data.get("content", transcribed_text)
             success = await asyncio.to_thread(create_diary_entry, diary_content)
             if success:
                 await thinking.edit_text(
@@ -3445,73 +3813,11 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
             else:
                 await thinking.edit_text("❌ Не удалось добавить в дневник")
-            return
-        
-        if tool_name == "create_calendar_event":
-            # Map tool_input to existing event creation format
-            user_routing_v = get_user_routing(msg.from_user)
-            data_mapped = {
-                "action": "create",
-                "type": tool_input.get("event_type", "event"),
-                "calendar": tool_input.get("calendar", "family"),
-                "category": tool_input.get("category", "personal"),
-                "title": tool_input.get("title", ""),
-                "description": tool_input.get("description", ""),
-                "date": tool_input.get("date", datetime.now(TIMEZONE).strftime("%Y-%m-%d")),
-                "time_start": tool_input.get("time_start"),
-                "time_end": tool_input.get("time_end"),
-                "all_day": tool_input.get("all_day", True),
-                "alarm_minutes": tool_input.get("alarm_minutes", 30),
-                "confidence": 0.95,
-            }
-            data_mapped = apply_calendar_override(data_mapped, user_routing_v)
-            
-            uid = await asyncio.to_thread(create_calendar_event, data_mapped)
-            if uid:
-                type_map = {"event": "📅 Событие", "task": "✅ Задача", "reminder": "🔔 Напоминание"}
-                cal_map = {"work": "💼 Рабочий", "family": "🏠 Семейный", "reminders": "⚠️ Напоминания"}
-                evt_type = data_mapped.get("type", "event")
-                response_text = (
-                    f"🎤 <b>Голосовое → Календарь!</b>\n\n"
-                    f"<b>Текст:</b> <i>{transcribed_text[:200]}</i>\n\n"
-                    f"<b>Тип:</b> {type_map.get(evt_type, evt_type)}\n"
-                    f"<b>Название:</b> {data_mapped.get('title', '?')}\n"
-                    f"<b>Дата:</b> {data_mapped.get('date', '?')}\n"
-                    f"<b>Календарь:</b> {cal_map.get(data_mapped.get('calendar', ''), '')}\n"
-                    f"\n🗑 <i>Ответьте «удали» чтобы удалить</i>"
-                )
-                await thinking.edit_text(response_text, parse_mode="HTML")
-                _event_store[thinking.message_id] = {"uid": uid, "calendar": data_mapped.get("calendar", "reminders")}
-                _save_event_store()
-            else:
-                await thinking.edit_text("❌ Не удалось создать запись в календаре")
-            return
-        
-        if tool_name == "mark_habit_done":
-            habit_name = tool_input.get("habit_name", "")
+        else:
             await thinking.edit_text(
-                f"🎤 <b>Распознано:</b> <i>{transcribed_text[:200]}</i>\n\n✅ Отмечаю привычку...",
+                f"🎤 <b>Распознано:</b>\n<i>{transcribed_text[:500]}</i>",
                 parse_mode="HTML"
             )
-            await _handle_habit_done(habit_name, thinking, chat_id)
-            return
-        
-        if tool_name == "web_search":
-            query = tool_input.get("query", "")
-            await thinking.edit_text(f"🎤🔍 <b>Ищу:</b> {query}...", parse_mode="HTML")
-            try:
-                results = await asyncio.to_thread(_web_search, query)
-                response = f"🎤 <b>Распознано:</b> <i>{transcribed_text[:150]}</i>\n\n🌐 <b>Результаты:</b>\n\n{results}"
-                await thinking.edit_text(response[:4000], parse_mode="HTML")
-            except Exception as e:
-                await thinking.edit_text(f"❌ Ошибка поиска: {str(e)[:100]}")
-            return
-        
-        # ── Fallback: show transcription ──
-        await thinking.edit_text(
-            f"🎤 <b>Распознано:</b>\n<i>{transcribed_text[:500]}</i>",
-            parse_mode="HTML"
-        )
     
     except Exception as e:
         logger.error("Voice handler error: %s", e)
@@ -3952,7 +4258,7 @@ async def handle_location(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ══════════════════════════════════════════════════════════
 # ██  YouTube Summarization
 # ══════════════════════════════════════════════════════════
-def _summarize_youtube(url: str, question: str = "summary") -> str:
+def _summarize_youtube(url: str) -> str:
     """Summarize a YouTube video using transcript/subtitles + Claude."""
     import urllib.request
     import urllib.parse
@@ -4715,66 +5021,54 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # (skip check removed — Tool Calling handles this via ask_clarification tool)
+    # Check if Claude decided to skip
+    if data.get("action") == "skip":
+        reasoning = data.get("reasoning", "Сообщение слишком абстрактное")
+        await thinking_msg.edit_text(
+            f"🤔 <b>Не создаю запись</b>\n\n"
+            f"💭 <i>{reasoning}</i>\n\n"
+            f"💡 Попробуйте уточнить: что именно нужно сделать, когда и где.",
+            parse_mode="HTML"
+        )
+        return
     
-    # (confidence check removed — Tool Calling handles uncertainty via ask_clarification tool)
+    # Check confidence threshold
+    confidence_val = data.get("confidence", 0)
+    if confidence_val < 0.4:
+        reasoning = data.get("reasoning", "Недостаточно информации")
+        await thinking_msg.edit_text(
+            f"⚠️ <b>Низкая уверенность ({confidence_val:.0%})</b>\n\n"
+            f"💭 <i>{reasoning}</i>\n\n"
+            f"💡 Уточните сообщение: добавьте дату, время или конкретное действие.",
+            parse_mode="HTML"
+        )
+        return
     
-    # Streaming-like: show what was understood (Tool Calling version)
-    tool_name_preview = data.get("tool_name", "")
-    tool_input_preview = data.get("tool_input", {})
-    tool_type_labels = {
-        "create_calendar_event": "📅 Событие",
-        "create_note": "📝 Заметка",
-        "create_diary_entry": "📖 Дневник",
-        "search_book": "📚 Поиск книги",
-        "mark_habit_done": "✅ Привычка",
-        "add_habit": "➕ Привычка",
-        "save_memory": "🧠 Память",
-        "server_status": "🖥 Сервер",
-        "manage_container": "🐳 Контейнер",
-        "web_search": "🔍 Поиск",
-        "add_expense": "💰 Расход",
-        "expense_report": "📊 Отчёт",
+    # Streaming-like: show what was understood
+    type_labels = {
+        "event": "📅 Событие", "task": "✅ Задача", "reminder": "🔔 Напоминание",
+        "note": "📝 Заметка", "diary": "📖 Дневник", "edit_event": "✏️ Редактирование",
     }
-    if tool_name_preview in tool_type_labels:
-        title_val = tool_input_preview.get("title", tool_input_preview.get("query", "..."))
-        progress_text = f"{tool_type_labels[tool_name_preview]}: <b>{title_val}</b>"
-        date_val = tool_input_preview.get("date", "")
-        if date_val:
-            progress_text += f"\n📅 {date_val}"
-            if tool_name_preview == "create_calendar_event":
+    if entry_type in type_labels:
+        progress_text = f"{type_labels[entry_type]}: <b>{data.get('title', '...')}</b>"
+        if data.get("date"):
+            progress_text += f"\n📅 {data['date']}"
+            # Check day overload for events
+            if entry_type in ("event", "task"):
                 try:
-                    overload = await asyncio.to_thread(_check_day_overload, date_val)
+                    overload = await asyncio.to_thread(_check_day_overload, data["date"])
                     if overload.get("is_overloaded"):
-                        ec = overload["event_count"]
-                        th = overload["total_hours"]
-                        progress_text += "\n\u26a0\ufe0f <i>\u0414\u0435\u043d\u044c \u0437\u0430\u0433\u0440\u0443\u0436\u0435\u043d: " + str(ec) + " \u0441\u043e\u0431\u044b\u0442\u0438\u0439 (" + str(th) + "\u0447)</i>"
+                        progress_text += f"\n⚠️ <i>День загружен: {overload['event_count']} событий ({overload['total_hours']}ч)</i>"
                 except Exception:
                     pass
-        time_val = tool_input_preview.get("time_start", "")
-        if time_val:
-            progress_text += f" в {time_val}"
+        if data.get("time_start"):
+            progress_text += f" в {data['time_start']}"
         try:
             await thinking_msg.edit_text(f"⏳ {progress_text}\n\n<i>Создаю...</i>", parse_mode="HTML")
         except Exception:
             pass
 
     original_text = update.message.text or ''
-    
-    # ═══ Check pending dialog state ═══
-    if chat_id in _dialog_state:
-        state = _dialog_state[chat_id]
-        if _time.time() < state.get("expires", 0):
-            # Append context to the message for Claude
-            pending_context = state.get("context", "")
-            if pending_context:
-                # Combine pending context with new message for better analysis
-                text = f"[Контекст предыдущего вопроса: {pending_context}] {text}"
-            del _dialog_state[chat_id]
-        else:
-            # Expired - remove stale state
-            del _dialog_state[chat_id]
-    
     # ═══ Tool Calling Dispatch ═══
     tool_name = data.get("tool_name", "")
     tool_input = data.get("tool_input", {})
@@ -4785,18 +5079,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if tool_name == "chat_response":
         response_msg = tool_input.get("message", "")
         if response_msg:
-            try:
-                await thinking_msg.edit_text(response_msg, parse_mode="HTML")
-            except Exception:
-                # HTML parse error - send without formatting
-                import html as _html_mod
-                clean_msg = _html_mod.unescape(response_msg)
-                # Remove any broken HTML tags
-                clean_msg = re.sub(r'<[^>]*$', '', clean_msg)
-                try:
-                    await thinking_msg.edit_text(clean_msg)
-                except Exception:
-                    await thinking_msg.edit_text(response_msg[:4000])
+            await thinking_msg.edit_text(response_msg, parse_mode="HTML")
         else:
             await thinking_msg.edit_text("👍")
         return
@@ -4946,6 +5229,210 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await thinking_msg.edit_text("\u274c Не удалось записать в дневник")
         return
     
+    # ── create_project ──
+    if tool_name == "create_project":
+        name = tool_input.get("name", "Новый проект")
+        description = tool_input.get("description", "")
+        tasks = tool_input.get("tasks", [])
+
+        await thinking_msg.edit_text(f"📋 <b>Создаю проект:</b> {name}...", parse_mode="HTML")
+
+        try:
+            project = await asyncio.to_thread(_create_project, name, description)
+
+            # Add initial tasks if provided
+            added_tasks = []
+            for t in tasks:
+                title = t.get("title", "")
+                priority = t.get("priority", "medium")
+                if title:
+                    task = await asyncio.to_thread(_add_project_task, project["id"], title, "", priority)
+                    added_tasks.append(task)
+
+            text = f"📋 <b>Проект создан!</b>\n\n"
+            text += f"🟦 <b>{name}</b>\n"
+            if description:
+                text += f"<i>{description}</i>\n"
+            text += f"\n🆔 ID: <code>{project['id']}</code>\n"
+
+            if added_tasks:
+                text += f"\n✅ Добавлено {len(added_tasks)} задач:\n"
+                for t in added_tasks:
+                    priority_icon = "🔴" if t.get("priority") == "high" else "🟡" if t.get("priority") == "medium" else "🟢"
+                    text += f"  {priority_icon} {t['title']}\n"
+
+            text += "\n💡 /projects — посмотреть канбан-доску"
+
+            keyboard = [[InlineKeyboardButton("📋 Открыть доску", callback_data=f"proj:board:{project['id']}")]]
+            await thinking_msg.edit_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
+            _add_knowledge_entry(original_text, f"project:{name}", "create_project", f"Project: {name}", "general")
+        except Exception as e:
+            logger.error("Create project error: %s", e)
+            await thinking_msg.edit_text(f"❌ Ошибка: {str(e)[:200]}")
+        return
+
+    # ── manage_project ──
+    if tool_name == "manage_project":
+        action = tool_input.get("action", "list_projects")
+        project_name = tool_input.get("project_name", "")
+        task_title = tool_input.get("task_title", "")
+        new_status = tool_input.get("new_status", "")
+        priority = tool_input.get("priority", "medium")
+
+        try:
+            data = await asyncio.to_thread(_load_projects)
+
+            if action == "list_projects":
+                projects = await asyncio.to_thread(_list_projects)
+                if not projects:
+                    await thinking_msg.edit_text("📋 Нет активных проектов. Напишите: \"Cоздай проект ...\"", parse_mode="HTML")
+                else:
+                    text = "📋 <b>Проекты:</b>\n\n"
+                    keyboard = []
+                    for p in projects:
+                        progress = int(p["done"] / p["task_count"] * 100) if p["task_count"] > 0 else 0
+                        text += f"{p.get('color', '🟦')} <b>{p['name']}</b> — {progress}% ({p['done']}/{p['task_count']})\n"
+                        keyboard.append([InlineKeyboardButton(f"{p.get('color', '🟦')} {p['name']}", callback_data=f"proj:board:{p['id']}")])
+                    await thinking_msg.edit_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
+                return
+
+            if action == "show_board":
+                # Find project by name
+                project = next((p for p in data["projects"] if project_name.lower() in p["name"].lower()), None)
+                if not project:
+                    await thinking_msg.edit_text(f"❌ Проект '{project_name}' не найден")
+                    return
+                board = await asyncio.to_thread(_get_project_board, project["id"])
+                # Build board text
+                text = f"{project.get('color', '🟦')} <b>{project['name']}</b>\n\n"
+                for status in ["todo", "in_progress", "done"]:
+                    label = PROJECT_STATUS_LABELS[status]
+                    col_tasks = board["columns"].get(status, [])
+                    text += f"<b>{label}</b> ({len(col_tasks)})\n"
+                    for t in col_tasks[:8]:
+                        pi = "🔴" if t.get("priority") == "high" else "🟡" if t.get("priority") == "medium" else "🟢"
+                        text += f"  {pi} {t['title']}\n"
+                    if not col_tasks:
+                        text += "  <i>пусто</i>\n"
+                    text += "\n"
+                await thinking_msg.edit_text(text, parse_mode="HTML")
+                return
+
+            if action == "add_task":
+                project = next((p for p in data["projects"] if project_name.lower() in p["name"].lower()), None)
+                if not project:
+                    await thinking_msg.edit_text(f"❌ Проект '{project_name}' не найден")
+                    return
+                task = await asyncio.to_thread(_add_project_task, project["id"], task_title, "", priority)
+                pi = "🔴" if priority == "high" else "🟡" if priority == "medium" else "🟢"
+                await thinking_msg.edit_text(
+                    f"✅ Задача добавлена в <b>{project['name']}</b>\n\n"
+                    f"{pi} {task_title}\n"
+                    f"📋 Статус: To Do",
+                    parse_mode="HTML"
+                )
+                return
+
+            if action == "move_task":
+                # Find task by title across all projects
+                task = next((t for t in data["tasks"] if task_title.lower() in t["title"].lower()), None)
+                if not task:
+                    await thinking_msg.edit_text(f"❌ Задача '{task_title}' не найдена")
+                    return
+                task = await asyncio.to_thread(_move_project_task, task["id"], new_status)
+                status_label = PROJECT_STATUS_LABELS.get(new_status, new_status)
+                await thinking_msg.edit_text(
+                    f"✔️ <b>{task['title']}</b> → {status_label}",
+                    parse_mode="HTML"
+                )
+                return
+
+            if action == "delete_task":
+                task = next((t for t in data["tasks"] if task_title.lower() in t["title"].lower()), None)
+                if not task:
+                    await thinking_msg.edit_text(f"❌ Задача '{task_title}' не найдена")
+                    return
+                await asyncio.to_thread(_delete_project_task, task["id"])
+                await thinking_msg.edit_text(f"🗑 Задача <b>{task['title']}</b> удалена", parse_mode="HTML")
+                return
+
+            if action == "delete_project":
+                project = next((p for p in data["projects"] if project_name.lower() in p["name"].lower()), None)
+                if not project:
+                    await thinking_msg.edit_text(f"❌ Проект '{project_name}' не найден")
+                    return
+                await asyncio.to_thread(_delete_project, project["id"])
+                await thinking_msg.edit_text(f"🗑 Проект <b>{project['name']}</b> удалён", parse_mode="HTML")
+                return
+
+        except Exception as e:
+            logger.error("Manage project error: %s", e)
+            await thinking_msg.edit_text(f"❌ Ошибка: {str(e)[:200]}")
+        return
+
+    # ── search_audiobook ──
+    if tool_name == "search_audiobook":
+        query = tool_input.get("query", "")
+        search_queries = tool_input.get("search_queries", [query])
+
+        await thinking_msg.edit_text(f"\U0001f3a7 <b>Ищу аудиокнигу:</b> {query}...", parse_mode="HTML")
+
+        results = None
+        for sq in search_queries:
+            results = await asyncio.to_thread(search_rutracker_audiobooks, sq)
+            if results:
+                break
+
+        if not results:
+            await thinking_msg.edit_text(
+                f"\U0001f3a7 <b>Аудиокнига не найдена:</b> {query}\n\n"
+                f"\U0001f4a1 Попробуйте другое название, автора или проверьте написание.",
+                parse_mode="HTML"
+            )
+            return
+
+        # Store results for callback
+        context.user_data["audiobook_search_results"] = results
+
+        text = f"\U0001f3a7 <b>Найдено {len(results)} аудиокниг:</b>\n\n"
+        keyboard = []
+
+        for i, ab in enumerate(results[:8]):
+            title = ab["title"][:70]
+            size = ab["size"]
+            seeds = ab["seeds"]
+
+            # Seed indicator
+            if seeds >= 50:
+                seed_icon = "\U0001f7e2"
+            elif seeds >= 10:
+                seed_icon = "\U0001f7e1"
+            elif seeds >= 1:
+                seed_icon = "\U0001f7e0"
+            else:
+                seed_icon = "\U0001f534"
+
+            text += f"{i+1}. <b>{title}</b>\n"
+            text += f"   \U0001f4e6 {size} | {seed_icon} Seeds: {seeds}\n\n"
+
+            keyboard.append([InlineKeyboardButton(
+                f"\U0001f3a7 {i+1}. {ab['title'][:30]}",
+                callback_data=f"abook:{i}:magnet"
+            )])
+
+        keyboard.append([InlineKeyboardButton("\u274c Отмена", callback_data="abook:cancel")])
+
+        await thinking_msg.edit_text(
+            text,
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
+        try:
+            _add_knowledge_entry(original_text, f"audiobook_search:{query}", "search_audiobook", f"Audiobook: {query}", "general")
+        except Exception:
+            pass
+        return
+
     # ── search_book ──
     if tool_name == "search_book":
         query = tool_input.get("query", "")
@@ -5178,6 +5665,77 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await thinking_msg.edit_text(f"\u274c Ошибка: {str(e)[:200]}")
         return
     
+    # ── add_income ──
+    if tool_name == "add_income":
+        amount = tool_input.get("amount", 0)
+        category = tool_input.get("category", "other")
+        description = tool_input.get("description", "")
+        date = tool_input.get("date")
+
+        try:
+            entry = await asyncio.to_thread(_add_income, amount, category, description, date)
+            cat_label = INCOME_CATEGORIES.get(category, category)
+            await thinking_msg.edit_text(
+                f"\U0001f4b5 <b>\u0414\u043e\u0445\u043e\u0434 \u0437\u0430\u043f\u0438\u0441\u0430\u043d!</b>\n\n"
+                f"{cat_label}: <b>{description}</b>\n"
+                f"\U0001f4b0 \u0421\u0443\u043c\u043c\u0430: <b>{amount:,.0f} \u20bd</b>\n"
+                f"\U0001f4c5 \u0414\u0430\u0442\u0430: {entry['date']}",
+                parse_mode="HTML"
+            )
+            _add_knowledge_entry(original_text, f"income:{amount}:{category}", "add_income", f"{description}: {amount}RUB", "finance")
+        except Exception as e:
+            logger.error("Add income error: %s", e)
+            await thinking_msg.edit_text(f"\u274c \u041e\u0448\u0438\u0431\u043a\u0430: {str(e)[:200]}")
+        return
+
+    # ── set_budget ──
+    if tool_name == "set_budget":
+        category = tool_input.get("category", "other")
+        monthly_limit = tool_input.get("monthly_limit", 0)
+
+        try:
+            result = await asyncio.to_thread(_set_budget, category, monthly_limit)
+            cat_label = EXPENSE_CATEGORIES.get(category, category)
+            await thinking_msg.edit_text(
+                f"\U0001f3af <b>\u0411\u044e\u0434\u0436\u0435\u0442 \u0443\u0441\u0442\u0430\u043d\u043e\u0432\u043b\u0435\u043d!</b>\n\n"
+                f"{cat_label}: <b>{monthly_limit:,.0f} \u20bd/\u043c\u0435\u0441</b>\n\n"
+                f"\U0001f4a1 \u041f\u0440\u0438 \u043f\u0440\u0435\u0432\u044b\u0448\u0435\u043d\u0438\u0438 \u0431\u0443\u0434\u0443 \u043f\u0440\u0435\u0434\u0443\u043f\u0440\u0435\u0436\u0434\u0430\u0442\u044c!",
+                parse_mode="HTML"
+            )
+            _add_knowledge_entry(original_text, f"budget:{category}:{monthly_limit}", "set_budget", f"{cat_label}: {monthly_limit}RUB/month", "finance")
+        except Exception as e:
+            logger.error("Set budget error: %s", e)
+            await thinking_msg.edit_text(f"\u274c \u041e\u0448\u0438\u0431\u043a\u0430: {str(e)[:200]}")
+        return
+
+    # ── finance_chart ──
+    if tool_name == "finance_chart":
+        chart_type = tool_input.get("chart_type", "bar")
+        period = tool_input.get("period", "month")
+
+        await thinking_msg.edit_text("\U0001f4ca <b>\u0413\u0435\u043d\u0435\u0440\u0438\u0440\u0443\u044e \u0433\u0440\u0430\u0444\u0438\u043a...</b>", parse_mode="HTML")
+
+        try:
+            if chart_type == "pie":
+                chart_path = await asyncio.to_thread(_generate_category_pie, period)
+            else:
+                chart_path = await asyncio.to_thread(_generate_finance_chart, period)
+
+            if chart_path and os.path.exists(chart_path):
+                chart_label = "Расходы по категориям" if chart_type == "pie" else "Расходы по дням"
+                caption = f"\U0001f4ca {chart_label} ({period})"
+                await thinking_msg.delete()
+                await update.effective_chat.send_photo(
+                    photo=open(chart_path, "rb"),
+                    caption=caption,
+                )
+            else:
+                await thinking_msg.edit_text("\u274c \u041d\u0435\u0434\u043e\u0441\u0442\u0430\u0442\u043e\u0447\u043d\u043e \u0434\u0430\u043d\u043d\u044b\u0445 \u0434\u043b\u044f \u0433\u0440\u0430\u0444\u0438\u043a\u0430. \u0414\u043e\u0431\u0430\u0432\u044c\u0442\u0435 \u0440\u0430\u0441\u0445\u043e\u0434\u044b \u0441\u043d\u0430\u0447\u0430\u043b\u0430.")
+        except Exception as e:
+            logger.error("Finance chart error: %s", e)
+            await thinking_msg.edit_text(f"\u274c \u041e\u0448\u0438\u0431\u043a\u0430: {str(e)[:200]}")
+        return
+
     # ── web_search ──
     if tool_name == "web_search":
         query = tool_input.get("query", "")
@@ -5474,6 +6032,781 @@ async def cmd_habits(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 # ══════════════════════════════════════════════════════════
+# ██  PROJECTS & KANBAN (Trello-killer)
+# ══════════════════════════════════════════════════════════
+
+PROJECTS_FILE = "/app/data/projects.json"
+
+PROJECT_STATUSES = ["todo", "in_progress", "done", "archived"]
+PROJECT_STATUS_LABELS = {
+    "todo": "📋 To Do",
+    "in_progress": "🔧 In Progress",
+    "done": "✅ Done",
+    "archived": "📦 Archived",
+}
+PROJECT_STATUS_EMOJI = {
+    "todo": "⬜",
+    "in_progress": "🟡",
+    "done": "✅",
+    "archived": "📦",
+}
+
+
+def _load_projects() -> dict:
+    """Load projects data: {projects: [...], tasks: [...]}"""
+    try:
+        with open(PROJECTS_FILE, "r") as f:
+            return json.loads(f.read())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {"projects": [], "tasks": []}
+
+
+def _save_projects(data: dict):
+    os.makedirs(os.path.dirname(PROJECTS_FILE), exist_ok=True)
+    with open(PROJECTS_FILE, "w") as f:
+        f.write(json.dumps(data, ensure_ascii=False, indent=2))
+
+
+def _create_project(name: str, description: str = "", color: str = "🟦") -> dict:
+    """Create a new project."""
+    data = _load_projects()
+    project = {
+        "id": str(uuid.uuid4())[:8],
+        "name": name,
+        "description": description,
+        "color": color,
+        "created": datetime.now(TIMEZONE).isoformat(),
+        "status": "active",
+    }
+    data["projects"].append(project)
+    _save_projects(data)
+    return project
+
+
+def _add_project_task(project_id: str, title: str, description: str = "", priority: str = "medium") -> dict:
+    """Add a task to a project."""
+    data = _load_projects()
+    
+    # Verify project exists
+    project = next((p for p in data["projects"] if p["id"] == project_id), None)
+    if not project:
+        raise ValueError(f"Проект {project_id} не найден")
+    
+    task = {
+        "id": str(uuid.uuid4())[:8],
+        "project_id": project_id,
+        "title": title,
+        "description": description,
+        "status": "todo",
+        "priority": priority,
+        "created": datetime.now(TIMEZONE).isoformat(),
+        "updated": datetime.now(TIMEZONE).isoformat(),
+    }
+    data["tasks"].append(task)
+    _save_projects(data)
+    return task
+
+
+def _move_project_task(task_id: str, new_status: str) -> dict:
+    """Move a task to a new status column."""
+    if new_status not in PROJECT_STATUSES:
+        raise ValueError(f"Неверный статус: {new_status}")
+    
+    data = _load_projects()
+    task = next((t for t in data["tasks"] if t["id"] == task_id), None)
+    if not task:
+        raise ValueError(f"Задача {task_id} не найдена")
+    
+    task["status"] = new_status
+    task["updated"] = datetime.now(TIMEZONE).isoformat()
+    _save_projects(data)
+    return task
+
+
+def _get_project_board(project_id: str = None) -> dict:
+    """Get kanban board view for a project or all projects."""
+    data = _load_projects()
+    projects = data["projects"]
+    tasks = data["tasks"]
+    
+    if project_id:
+        projects = [p for p in projects if p["id"] == project_id]
+        tasks = [t for t in tasks if t["project_id"] == project_id]
+    
+    board = {
+        "projects": projects,
+        "columns": {},
+        "stats": {"total": len(tasks), "todo": 0, "in_progress": 0, "done": 0},
+    }
+    
+    for status in PROJECT_STATUSES[:3]:  # Skip archived
+        col_tasks = [t for t in tasks if t["status"] == status]
+        board["columns"][status] = col_tasks
+        board["stats"][status] = len(col_tasks)
+    
+    return board
+
+
+def _delete_project(project_id: str) -> bool:
+    """Delete a project and all its tasks."""
+    data = _load_projects()
+    data["projects"] = [p for p in data["projects"] if p["id"] != project_id]
+    data["tasks"] = [t for t in data["tasks"] if t["project_id"] != project_id]
+    _save_projects(data)
+    return True
+
+
+def _delete_project_task(task_id: str) -> bool:
+    """Delete a single task."""
+    data = _load_projects()
+    data["tasks"] = [t for t in data["tasks"] if t["id"] != task_id]
+    _save_projects(data)
+    return True
+
+
+def _list_projects() -> list:
+    """List all active projects with task counts."""
+    data = _load_projects()
+    result = []
+    for p in data["projects"]:
+        if p.get("status") == "archived":
+            continue
+        tasks = [t for t in data["tasks"] if t["project_id"] == p["id"]]
+        todo = len([t for t in tasks if t["status"] == "todo"])
+        in_prog = len([t for t in tasks if t["status"] == "in_progress"])
+        done = len([t for t in tasks if t["status"] == "done"])
+        result.append({
+            **p,
+            "task_count": len(tasks),
+            "todo": todo,
+            "in_progress": in_prog,
+            "done": done,
+        })
+    return result
+
+
+async def cmd_projects(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /projects command — show kanban board."""
+    if ALLOWED_CHAT_IDS and update.effective_chat.id not in ALLOWED_CHAT_IDS:
+        return
+    
+    projects = await asyncio.to_thread(_list_projects)
+    
+    if not projects:
+        await update.message.reply_text(
+            "📋 <b>Проекты</b>\n\n"
+            "Нет активных проектов.\n\n"
+            "💡 Напишите боту:\n"
+            '<i>"Создай проект Ремонт квартиры"</i>',
+            parse_mode="HTML"
+        )
+        return
+    
+    text = "📋 <b>Проекты:</b>\n\n"
+    keyboard = []
+    
+    for p in projects:
+        progress = 0
+        if p["task_count"] > 0:
+            progress = int(p["done"] / p["task_count"] * 100)
+        
+        bar_len = 10
+        filled = int(progress / 100 * bar_len)
+        bar = "█" * filled + "░" * (bar_len - filled)
+        
+        text += f"{p.get('color', '🟦')} <b>{p['name']}</b>\n"
+        text += f"   [{bar}] {progress}%\n"
+        text += f"   ⬜ {p['todo']} | 🟡 {p['in_progress']} | ✅ {p['done']}\n\n"
+        
+        keyboard.append([InlineKeyboardButton(
+            f"{p.get('color', '🟦')} {p['name']}",
+            callback_data=f"proj:board:{p['id']}"
+        )])
+    
+    await update.message.reply_text(
+        text,
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None,
+    )
+
+
+async def callback_project(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle project callback queries."""
+    query = update.callback_query
+    await query.answer()
+    
+    data = query.data  # proj:board:{id} or proj:move:{task_id}:{status}
+    parts = data.split(":")
+    
+    if len(parts) < 3:
+        return
+    
+    action = parts[1]
+    
+    if action == "board":
+        project_id = parts[2]
+        board = await asyncio.to_thread(_get_project_board, project_id)
+        
+        if not board["projects"]:
+            await query.edit_message_text("❌ Проект не найден")
+            return
+        
+        proj = board["projects"][0]
+        text = f"{proj.get('color', '🟦')} <b>{proj['name']}</b>\n"
+        if proj.get("description"):
+            text += f"<i>{proj['description']}</i>\n"
+        text += f"\n──────────────────────────\n"
+        
+        keyboard = []
+        
+        for status in ["todo", "in_progress", "done"]:
+            label = PROJECT_STATUS_LABELS[status]
+            col_tasks = board["columns"].get(status, [])
+            text += f"\n<b>{label}</b> ({len(col_tasks)})\n"
+            
+            if not col_tasks:
+                text += "  <i>пусто</i>\n"
+            else:
+                for t in col_tasks[:5]:
+                    priority_icon = "🔴" if t.get("priority") == "high" else "🟡" if t.get("priority") == "medium" else "🟢"
+                    text += f"  {priority_icon} {t['title']}\n"
+                    
+                    # Add move buttons
+                    move_buttons = []
+                    if status != "todo":
+                        prev_status = PROJECT_STATUSES[PROJECT_STATUSES.index(status) - 1]
+                        move_buttons.append(InlineKeyboardButton(
+                            f"⬅ {t['title'][:15]}",
+                            callback_data=f"proj:move:{t['id']}:{prev_status}"
+                        ))
+                    if status != "done":
+                        next_status = PROJECT_STATUSES[PROJECT_STATUSES.index(status) + 1]
+                        move_buttons.append(InlineKeyboardButton(
+                            f"{t['title'][:15]} ➡",
+                            callback_data=f"proj:move:{t['id']}:{next_status}"
+                        ))
+                    if move_buttons:
+                        keyboard.append(move_buttons)
+        
+        # Stats
+        total = board["stats"]["total"]
+        done = board["stats"]["done"]
+        progress = int(done / total * 100) if total > 0 else 0
+        text += f"\n──────────────────────────\n"
+        text += f"📊 Прогресс: {done}/{total} ({progress}%)\n"
+        
+        keyboard.append([InlineKeyboardButton("🔙 Назад к проектам", callback_data="proj:list")])
+        
+        await query.edit_message_text(
+            text,
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
+    
+    elif action == "move":
+        if len(parts) < 4:
+            return
+        task_id = parts[2]
+        new_status = parts[3]
+        
+        try:
+            task = await asyncio.to_thread(_move_project_task, task_id, new_status)
+            status_label = PROJECT_STATUS_LABELS.get(new_status, new_status)
+            
+            # Reload the board
+            board = await asyncio.to_thread(_get_project_board, task["project_id"])
+            proj = board["projects"][0] if board["projects"] else None
+            
+            if proj:
+                # Rebuild the board view (same as above)
+                text = f"{proj.get('color', '🟦')} <b>{proj['name']}</b>\n"
+                text += f"\n✔️ <i>{task['title']}</i> → {status_label}\n"
+                text += f"\n──────────────────────────\n"
+                
+                keyboard = []
+                for status in ["todo", "in_progress", "done"]:
+                    label = PROJECT_STATUS_LABELS[status]
+                    col_tasks = board["columns"].get(status, [])
+                    text += f"\n<b>{label}</b> ({len(col_tasks)})\n"
+                    
+                    if not col_tasks:
+                        text += "  <i>пусто</i>\n"
+                    else:
+                        for t in col_tasks[:5]:
+                            priority_icon = "🔴" if t.get("priority") == "high" else "🟡" if t.get("priority") == "medium" else "🟢"
+                            text += f"  {priority_icon} {t['title']}\n"
+                            
+                            move_buttons = []
+                            if status != "todo":
+                                prev_s = PROJECT_STATUSES[PROJECT_STATUSES.index(status) - 1]
+                                move_buttons.append(InlineKeyboardButton(
+                                    f"⬅ {t['title'][:15]}",
+                                    callback_data=f"proj:move:{t['id']}:{prev_s}"
+                                ))
+                            if status != "done":
+                                next_s = PROJECT_STATUSES[PROJECT_STATUSES.index(status) + 1]
+                                move_buttons.append(InlineKeyboardButton(
+                                    f"{t['title'][:15]} ➡",
+                                    callback_data=f"proj:move:{t['id']}:{next_s}"
+                                ))
+                            if move_buttons:
+                                keyboard.append(move_buttons)
+                
+                total = board["stats"]["total"]
+                done_count = board["stats"]["done"]
+                progress = int(done_count / total * 100) if total > 0 else 0
+                text += f"\n──────────────────────────\n"
+                text += f"📊 Прогресс: {done_count}/{total} ({progress}%)\n"
+                
+                keyboard.append([InlineKeyboardButton("🔙 Назад к проектам", callback_data="proj:list")])
+                
+                await query.edit_message_text(
+                    text,
+                    parse_mode="HTML",
+                    reply_markup=InlineKeyboardMarkup(keyboard),
+                )
+            else:
+                await query.edit_message_text(f"✔️ Задача перемещена в {status_label}")
+        except Exception as e:
+            logger.error("Move task error: %s", e)
+            await query.edit_message_text(f"❌ Ошибка: {str(e)[:200]}")
+    
+    elif action == "list":
+        # Show all projects list
+        projects = await asyncio.to_thread(_list_projects)
+        if not projects:
+            await query.edit_message_text("📋 Нет активных проектов")
+            return
+        
+        text = "📋 <b>Проекты:</b>\n\n"
+        keyboard = []
+        for p in projects:
+            progress = int(p["done"] / p["task_count"] * 100) if p["task_count"] > 0 else 0
+            bar_len = 10
+            filled = int(progress / 100 * bar_len)
+            bar = "█" * filled + "░" * (bar_len - filled)
+            text += f"{p.get('color', '🟦')} <b>{p['name']}</b>\n"
+            text += f"   [{bar}] {progress}%\n"
+            text += f"   ⬜ {p['todo']} | 🟡 {p['in_progress']} | ✅ {p['done']}\n\n"
+            keyboard.append([InlineKeyboardButton(
+                f"{p.get('color', '🟦')} {p['name']}",
+                callback_data=f"proj:board:{p['id']}"
+            )])
+        
+        await query.edit_message_text(
+            text,
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
+    
+    elif action == "del":
+        if len(parts) < 3:
+            return
+        task_id = parts[2]
+        try:
+            await asyncio.to_thread(_delete_project_task, task_id)
+            await query.edit_message_text("🗑 Задача удалена")
+        except Exception as e:
+            await query.edit_message_text(f"❌ Ошибка: {str(e)[:200]}")
+
+
+# ══════════════════════════════════════════════════════════
+# ██  FINANCE TRACKER (Zenmoney-killer)
+# ══════════════════════════════════════════════════════════
+
+FINANCE_FILE = "/app/data/finance.json"
+
+EXPENSE_CATEGORIES = {
+    "food": "🍔 Еда",
+    "transport": "🚗 Транспорт",
+    "housing": "🏠 Жильё",
+    "utilities": "💡 Коммуналка",
+    "entertainment": "🎬 Развлечения",
+    "health": "🏥 Здоровье",
+    "clothing": "👕 Одежда",
+    "subscriptions": "📱 Подписки",
+    "education": "📚 Образование",
+    "other": "📦 Другое",
+}
+
+INCOME_CATEGORIES = {
+    "salary": "💼 Зарплата",
+    "freelance": "💻 Фриланс",
+    "investment": "📈 Инвестиции",
+    "gift": "🎁 Подарок",
+    "refund": "🔄 Возврат",
+    "other": "💵 Другое",
+}
+
+
+def _load_finance() -> dict:
+    """Load finance data."""
+    try:
+        with open(FINANCE_FILE, "r") as f:
+            return json.loads(f.read())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {
+            "transactions": [],
+            "budgets": {},
+            "recurring": [],
+        }
+
+
+def _save_finance(data: dict):
+    os.makedirs(os.path.dirname(FINANCE_FILE), exist_ok=True)
+    with open(FINANCE_FILE, "w") as f:
+        f.write(json.dumps(data, ensure_ascii=False, indent=2))
+
+
+def _add_expense(amount: float, category: str, description: str, date: str = None) -> dict:
+    """Add an expense transaction."""
+    data = _load_finance()
+    entry = {
+        "id": str(uuid.uuid4())[:8],
+        "type": "expense",
+        "amount": amount,
+        "category": category,
+        "description": description,
+        "date": date or datetime.now(TIMEZONE).strftime("%Y-%m-%d"),
+        "created": datetime.now(TIMEZONE).isoformat(),
+    }
+    data["transactions"].append(entry)
+    _save_finance(data)
+    return entry
+
+
+def _add_income(amount: float, category: str, description: str, date: str = None) -> dict:
+    """Add an income transaction."""
+    data = _load_finance()
+    entry = {
+        "id": str(uuid.uuid4())[:8],
+        "type": "income",
+        "amount": amount,
+        "category": category,
+        "description": description,
+        "date": date or datetime.now(TIMEZONE).strftime("%Y-%m-%d"),
+        "created": datetime.now(TIMEZONE).isoformat(),
+    }
+    data["transactions"].append(entry)
+    _save_finance(data)
+    return entry
+
+
+def _set_budget(category: str, monthly_limit: float) -> dict:
+    """Set a monthly budget for a category."""
+    data = _load_finance()
+    data["budgets"][category] = {
+        "limit": monthly_limit,
+        "updated": datetime.now(TIMEZONE).isoformat(),
+    }
+    _save_finance(data)
+    return {"category": category, "limit": monthly_limit}
+
+
+def _get_expense_report(period: str = "month", category: str = None) -> dict:
+    """Generate expense report for a given period."""
+    data = _load_finance()
+    transactions = data["transactions"]
+    now = datetime.now(TIMEZONE)
+
+    # Filter by period
+    if period == "today":
+        start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        period_label = f"за сегодня ({now.strftime('%d.%m.%Y')})"
+    elif period == "week":
+        start = now - timedelta(days=now.weekday())
+        start = start.replace(hour=0, minute=0, second=0, microsecond=0)
+        period_label = "за неделю"
+    elif period == "month":
+        start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        period_label = f"за {now.strftime('%B %Y')}"
+    elif period == "year":
+        start = now.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
+        period_label = f"за {now.year} год"
+    else:
+        start = now - timedelta(days=30)
+        period_label = "за 30 дней"
+
+    start_str = start.strftime("%Y-%m-%d")
+
+    # Filter transactions
+    filtered = [
+        t for t in transactions
+        if t["type"] == "expense" and t["date"] >= start_str
+    ]
+    if category:
+        filtered = [t for t in filtered if t["category"] == category]
+
+    # Calculate totals
+    total = sum(t["amount"] for t in filtered)
+    by_category = {}
+    for t in filtered:
+        cat = t["category"]
+        by_category[cat] = by_category.get(cat, 0) + t["amount"]
+
+    # Budget check
+    budgets = data.get("budgets", {})
+    budget_status = {}
+    for cat, budget_info in budgets.items():
+        limit = budget_info["limit"]
+        spent = by_category.get(cat, 0)
+        remaining = limit - spent
+        pct = (spent / limit * 100) if limit > 0 else 0
+        budget_status[cat] = {
+            "limit": limit,
+            "spent": spent,
+            "remaining": remaining,
+            "percent": pct,
+            "over": remaining < 0,
+        }
+
+    # Income for the same period
+    income_filtered = [
+        t for t in transactions
+        if t["type"] == "income" and t["date"] >= start_str
+    ]
+    total_income = sum(t["amount"] for t in income_filtered)
+
+    return {
+        "period": period_label,
+        "total": total,
+        "total_income": total_income,
+        "balance": total_income - total,
+        "count": len(filtered),
+        "by_category": by_category,
+        "budget_status": budget_status,
+        "recent": sorted(filtered, key=lambda x: x["date"], reverse=True)[:10],
+    }
+
+
+def _get_finance_chart_data(period: str = "month") -> dict:
+    """Get data for finance charts."""
+    data = _load_finance()
+    transactions = data["transactions"]
+    now = datetime.now(TIMEZONE)
+
+    if period == "month":
+        # Daily spending for current month
+        start = now.replace(day=1)
+        days = {}
+        for t in transactions:
+            if t["type"] == "expense" and t["date"] >= start.strftime("%Y-%m-%d"):
+                day = t["date"]
+                days[day] = days.get(day, 0) + t["amount"]
+
+        return {"type": "daily", "data": days, "period": now.strftime("%B %Y")}
+
+    elif period == "year":
+        # Monthly spending for current year
+        months = {}
+        for t in transactions:
+            if t["type"] == "expense" and t["date"][:4] == str(now.year):
+                month = t["date"][:7]  # YYYY-MM
+                months[month] = months.get(month, 0) + t["amount"]
+
+        return {"type": "monthly", "data": months, "period": str(now.year)}
+
+    return {"type": "empty", "data": {}}
+
+
+def _generate_finance_chart(period: str = "month") -> str | None:
+    """Generate a finance chart image and return file path."""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        import matplotlib.dates as mdates
+
+        chart_data = _get_finance_chart_data(period)
+
+        if not chart_data["data"]:
+            return None
+
+        fig, ax = plt.subplots(figsize=(10, 5))
+
+        if chart_data["type"] == "daily":
+            dates = sorted(chart_data["data"].keys())
+            values = [chart_data["data"][d] for d in dates]
+            ax.bar(dates, values, color="#FF6B6B", alpha=0.8)
+            ax.set_title(f"Расходы по дням — {chart_data['period']}", fontsize=14, fontweight="bold")
+            ax.set_xlabel("Дата")
+            plt.xticks(rotation=45, ha="right")
+
+        elif chart_data["type"] == "monthly":
+            months = sorted(chart_data["data"].keys())
+            values = [chart_data["data"][m] for m in months]
+            ax.bar(months, values, color="#4ECDC4", alpha=0.8)
+            ax.set_title(f"Расходы по месяцам — {chart_data['period']}", fontsize=14, fontweight="bold")
+            ax.set_xlabel("Месяц")
+
+        ax.set_ylabel("Рубли (₽)")
+        ax.grid(axis="y", alpha=0.3)
+        plt.tight_layout()
+
+        chart_path = "/app/data/finance_chart.png"
+        os.makedirs(os.path.dirname(chart_path), exist_ok=True)
+        fig.savefig(chart_path, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+
+        return chart_path
+    except Exception as e:
+        logger.error("Finance chart error: %s", e)
+        return None
+
+
+def _generate_category_pie(period: str = "month") -> str | None:
+    """Generate a pie chart of expenses by category."""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        report = _get_expense_report(period)
+        by_cat = report["by_category"]
+
+        if not by_cat:
+            return None
+
+        labels = []
+        sizes = []
+        colors = ["#FF6B6B", "#4ECDC4", "#45B7D1", "#96CEB4", "#FFEAA7", "#DDA0DD", "#98D8C8", "#F7DC6F", "#BB8FCE", "#85C1E9"]
+
+        sorted_cats = sorted(by_cat.items(), key=lambda x: x[1], reverse=True)
+        for cat, amount in sorted_cats:
+            cat_label = EXPENSE_CATEGORIES.get(cat, cat)
+            labels.append(f"{cat_label}\n{amount:,.0f} ₽")
+            sizes.append(amount)
+
+        fig, ax = plt.subplots(figsize=(8, 8))
+        wedges, texts, autotexts = ax.pie(
+            sizes,
+            labels=labels,
+            colors=colors[:len(sizes)],
+            autopct="%1.0f%%",
+            startangle=90,
+            textprops={"fontsize": 10},
+        )
+        ax.set_title(f"Расходы по категориям\nИтого: {report['total']:,.0f} ₽", fontsize=14, fontweight="bold")
+
+        chart_path = "/app/data/finance_pie.png"
+        os.makedirs(os.path.dirname(chart_path), exist_ok=True)
+        fig.savefig(chart_path, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+
+        return chart_path
+    except Exception as e:
+        logger.error("Finance pie chart error: %s", e)
+        return None
+
+
+def _delete_transaction(transaction_id: str) -> bool:
+    """Delete a transaction by ID."""
+    data = _load_finance()
+    data["transactions"] = [t for t in data["transactions"] if t["id"] != transaction_id]
+    _save_finance(data)
+    return True
+
+
+async def cmd_finance(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /finance command — show financial dashboard."""
+    if ALLOWED_CHAT_IDS and update.effective_chat.id not in ALLOWED_CHAT_IDS:
+        return
+
+    args = context.args if context.args else []
+    period = args[0] if args else "month"
+
+    await update.message.reply_text("💰 <b>Считаю финансы...</b>", parse_mode="HTML")
+
+    try:
+        report = await asyncio.to_thread(_get_expense_report, period)
+
+        text = f"💰 <b>Финансовый отчёт {report['period']}:</b>\n\n"
+
+        # Balance
+        balance_icon = "🟢" if report["balance"] >= 0 else "🔴"
+        text += f"💵 Доход: <b>{report['total_income']:,.0f} ₽</b>\n"
+        text += f"💸 Расход: <b>{report['total']:,.0f} ₽</b>\n"
+        text += f"{balance_icon} Баланс: <b>{report['balance']:,.0f} ₽</b>\n\n"
+
+        # Categories
+        if report["by_category"]:
+            text += "<b>По категориям:</b>\n"
+            sorted_cats = sorted(report["by_category"].items(), key=lambda x: x[1], reverse=True)
+            for cat, amount in sorted_cats:
+                cat_label = EXPENSE_CATEGORIES.get(cat, cat)
+                pct = (amount / report["total"] * 100) if report["total"] > 0 else 0
+                bar = "█" * max(1, int(pct / 5))
+                text += f"  {cat_label}: <b>{amount:,.0f} ₽</b> ({pct:.0f}%) {bar}\n"
+
+        # Budget alerts
+        if report["budget_status"]:
+            text += "\n<b>🎯 Бюджеты:</b>\n"
+            for cat, bs in report["budget_status"].items():
+                cat_label = EXPENSE_CATEGORIES.get(cat, cat)
+                icon = "🔴" if bs["over"] else "🟡" if bs["percent"] > 80 else "🟢"
+                text += f"  {icon} {cat_label}: {bs['spent']:,.0f}/{bs['limit']:,.0f} ₽ ({bs['percent']:.0f}%)\n"
+                if bs["over"]:
+                    text += f"    ⚠️ Превышение на {abs(bs['remaining']):,.0f} ₽!\n"
+
+        # Recent
+        if report["recent"]:
+            text += "\n<b>Последние операции:</b>\n"
+            for e in report["recent"][:5]:
+                cat_label = EXPENSE_CATEGORIES.get(e["category"], "")
+                text += f"  {e['date']} {cat_label} {e['description']}: <b>{e['amount']:,.0f} ₽</b>\n"
+
+        keyboard = [
+            [InlineKeyboardButton("📊 График расходов", callback_data=f"fin:chart:{period}")],
+            [InlineKeyboardButton("🧩 По категориям", callback_data=f"fin:pie:{period}")],
+        ]
+
+        await update.message.reply_text(
+            text,
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
+    except Exception as e:
+        logger.error("Finance command error: %s", e)
+        await update.message.reply_text(f"❌ Ошибка: {str(e)[:200]}")
+
+
+async def callback_finance(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle finance callback queries (charts)."""
+    query = update.callback_query
+    await query.answer()
+
+    data = query.data  # fin:chart:month or fin:pie:month
+    parts = data.split(":")
+    if len(parts) < 3:
+        return
+
+    action = parts[1]
+    period = parts[2]
+
+    if action == "chart":
+        await query.edit_message_text("📊 <b>Генерирую график...</b>", parse_mode="HTML")
+        chart_path = await asyncio.to_thread(_generate_finance_chart, period)
+        if chart_path and os.path.exists(chart_path):
+            await query.message.reply_photo(
+                photo=open(chart_path, "rb"),
+                caption=f"📊 Расходы по дням ({period})",
+            )
+        else:
+            await query.edit_message_text("❌ Недостаточно данных для графика")
+
+    elif action == "pie":
+        await query.edit_message_text("🧩 <b>Генерирую диаграмму...</b>", parse_mode="HTML")
+        chart_path = await asyncio.to_thread(_generate_category_pie, period)
+        if chart_path and os.path.exists(chart_path):
+            await query.message.reply_photo(
+                photo=open(chart_path, "rb"),
+                caption=f"🧩 Расходы по категориям ({period})",
+            )
+        else:
+            await query.edit_message_text("❌ Недостаточно данных для диаграммы")
+
+
+# ══════════════════════════════════════════════════════════
 # ██  HEALTH CHECK SERVER
 # ══════════════════════════════════════════════════════════
 
@@ -5544,320 +6877,6 @@ def _save_read_later(data: list):
     os.makedirs(os.path.dirname(READ_LATER_FILE), exist_ok=True)
     with open(READ_LATER_FILE, "w") as f:
         f.write(json.dumps(data, ensure_ascii=False, indent=2))
-
-
-
-# ══════════════════════════════════════════════════════════
-# ██  Knowledge Base (auto-learning from interactions)
-# ══════════════════════════════════════════════════════════
-KNOWLEDGE_BASE_FILE = os.path.join(os.path.dirname(__file__), "data", "knowledge_base.json")
-
-def _load_knowledge() -> list:
-    """Load knowledge base entries."""
-    try:
-        with open(KNOWLEDGE_BASE_FILE, "r") as f:
-            return json.loads(f.read())
-    except (FileNotFoundError, json.JSONDecodeError):
-        return []
-
-def _save_knowledge(data: list):
-    """Save knowledge base."""
-    os.makedirs(os.path.dirname(KNOWLEDGE_BASE_FILE), exist_ok=True)
-    # Keep max 500 entries
-    if len(data) > 500:
-        data = data[-500:]
-    with open(KNOWLEDGE_BASE_FILE, "w") as f:
-        f.write(json.dumps(data, ensure_ascii=False, indent=2))
-
-def _add_knowledge_entry(user_message: str, action_key: str, tool_used: str, result: str, category: str = "general"):
-    """Add an entry to the knowledge base."""
-    try:
-        kb = _load_knowledge()
-        entry = {
-            "timestamp": datetime.now(TIMEZONE).strftime("%Y-%m-%d %H:%M"),
-            "user_message": user_message[:200],
-            "action_key": action_key,
-            "tool_used": tool_used,
-            "result": result[:300],
-            "category": category,
-        }
-        kb.append(entry)
-        _save_knowledge(kb)
-    except Exception as e:
-        logger.error("Knowledge base write error: %s", e)
-
-def _search_knowledge(query: str, category: str = "all") -> list:
-    """Search knowledge base by query string and optional category."""
-    kb = _load_knowledge()
-    query_lower = query.lower()
-    results = []
-    for entry in reversed(kb):  # newest first
-        if category != "all" and entry.get("category", "") != category:
-            continue
-        # Search in user_message, action_key, result
-        searchable = f"{entry.get('user_message', '')} {entry.get('action_key', '')} {entry.get('result', '')}".lower()
-        if query_lower in searchable:
-            results.append(entry)
-        if len(results) >= 20:
-            break
-    return results
-
-
-# ══════════════════════════════════════════════════════════
-# ██  Expense Tracker
-# ══════════════════════════════════════════════════════════
-EXPENSES_FILE = os.path.join(os.path.dirname(__file__), "data", "expenses.json")
-
-EXPENSE_CATEGORIES = {
-    "food": "🍔 Еда",
-    "transport": "🚗 Транспорт",
-    "housing": "🏠 Жильё",
-    "utilities": "💡 Коммуналка",
-    "health": "🏥 Здоровье",
-    "entertainment": "🎬 Развлечения",
-    "clothing": "👕 Одежда",
-    "education": "📚 Образование",
-    "subscriptions": "📱 Подписки",
-    "gifts": "🎁 Подарки",
-    "travel": "✈️ Путешествия",
-    "other": "📦 Прочее",
-}
-
-def _load_expenses() -> list:
-    """Load expense records."""
-    try:
-        with open(EXPENSES_FILE, "r") as f:
-            return json.loads(f.read())
-    except (FileNotFoundError, json.JSONDecodeError):
-        return []
-
-def _save_expenses(data: list):
-    """Save expense records."""
-    os.makedirs(os.path.dirname(EXPENSES_FILE), exist_ok=True)
-    with open(EXPENSES_FILE, "w") as f:
-        f.write(json.dumps(data, ensure_ascii=False, indent=2))
-
-def _add_expense(amount: float, category: str, description: str, date: str = None) -> dict:
-    """Add a new expense entry."""
-    expenses = _load_expenses()
-    if not date:
-        date = datetime.now(TIMEZONE).strftime("%Y-%m-%d")
-    entry = {
-        "id": str(uuid.uuid4())[:8],
-        "date": date,
-        "amount": float(amount),
-        "category": category,
-        "description": description,
-        "created": datetime.now(TIMEZONE).strftime("%Y-%m-%d %H:%M"),
-    }
-    expenses.append(entry)
-    _save_expenses(expenses)
-    return entry
-
-def _get_expense_report(period: str = "month", category: str = None) -> dict:
-    """Generate expense report for a given period."""
-    expenses = _load_expenses()
-    now = datetime.now(TIMEZONE)
-    
-    # Filter by period
-    if period == "today":
-        start = now.replace(hour=0, minute=0, second=0)
-        period_label = f"за сегодня ({now.strftime('%d.%m.%Y')})"
-    elif period == "week":
-        start = now - timedelta(days=7)
-        period_label = f"за неделю ({start.strftime('%d.%m')} - {now.strftime('%d.%m.%Y')})"
-    elif period == "month":
-        start = now.replace(day=1, hour=0, minute=0, second=0)
-        period_label = f"за {now.strftime('%B %Y')}"
-    elif period == "year":
-        start = now.replace(month=1, day=1, hour=0, minute=0, second=0)
-        period_label = f"за {now.year} год"
-    else:
-        start = now - timedelta(days=30)
-        period_label = "за последние 30 дней"
-    
-    start_str = start.strftime("%Y-%m-%d")
-    filtered = [e for e in expenses if e.get("date", "") >= start_str]
-    
-    # Filter by category
-    if category and category != "all":
-        filtered = [e for e in filtered if e.get("category", "") == category]
-    
-    # Calculate stats
-    total = sum(e.get("amount", 0) for e in filtered)
-    by_category = {}
-    for e in filtered:
-        cat = e.get("category", "other")
-        by_category[cat] = by_category.get(cat, 0) + e.get("amount", 0)
-    
-    return {
-        "period": period_label,
-        "total": total,
-        "count": len(filtered),
-        "by_category": by_category,
-        "recent": sorted(filtered, key=lambda x: x.get("date", ""))[-10:],
-    }
-
-
-# ══════════════════════════════════════════════════════════
-# ██  Server Management (Docker)
-# ══════════════════════════════════════════════════════════
-import subprocess
-
-def _get_server_status(check_type: str = "all") -> str:
-    """Get server/container status."""
-    try:
-        if check_type == "containers" or check_type == "all":
-            result = subprocess.run(
-                ["docker", "ps", "--format", "{{.Names}}\t{{.Status}}\t{{.Image}}"],
-                capture_output=True, text=True, timeout=15
-            )
-            lines = result.stdout.strip().split("\n")
-            
-            healthy = []
-            unhealthy = []
-            for line in lines:
-                if not line.strip():
-                    continue
-                parts = line.split("\t")
-                name = parts[0] if len(parts) > 0 else "?"
-                status = parts[1] if len(parts) > 1 else "?"
-                if "(healthy)" in status or "Up" in status:
-                    healthy.append(f"  ✅ {name}: {status}")
-                else:
-                    unhealthy.append(f"  ❌ {name}: {status}")
-            
-            response = f"🖥️ <b>Статус контейнеров ({len(lines)} шт.):</b>\n\n"
-            if unhealthy:
-                response += "<b>⚠️ Проблемные:</b>\n" + "\n".join(unhealthy) + "\n\n"
-            response += "<b>Работают:</b>\n" + "\n".join(healthy[:30])
-            
-            if check_type == "all":
-                # Add disk and memory info
-                disk = subprocess.run(["df", "-h", "/"], capture_output=True, text=True, timeout=5)
-                mem = subprocess.run(["free", "-h"], capture_output=True, text=True, timeout=5)
-                response += f"\n\n<b>💾 Диск:</b>\n<pre>{disk.stdout.strip()}</pre>"
-                response += f"\n\n<b>🧠 Память:</b>\n<pre>{mem.stdout.strip()}</pre>"
-            
-            return response
-        
-        elif check_type == "disk":
-            disk = subprocess.run(["df", "-h"], capture_output=True, text=True, timeout=5)
-            return f"💾 <b>Дисковое пространство:</b>\n<pre>{disk.stdout.strip()}</pre>"
-        
-        elif check_type == "memory":
-            mem = subprocess.run(["free", "-h"], capture_output=True, text=True, timeout=5)
-            return f"🧠 <b>Оперативная память:</b>\n<pre>{mem.stdout.strip()}</pre>"
-        
-        elif check_type == "cpu":
-            uptime = subprocess.run(["uptime"], capture_output=True, text=True, timeout=5)
-            return f"⚡ <b>CPU Load:</b>\n<pre>{uptime.stdout.strip()}</pre>"
-        
-        else:
-            return f"❓ Неизвестный тип проверки: {check_type}"
-    
-    except subprocess.TimeoutExpired:
-        return "⏰ Таймаут выполнения команды"
-    except Exception as e:
-        return f"❌ Ошибка: {str(e)}"
-
-def _manage_container(container: str, action: str) -> str:
-    """Manage a Docker container (restart, stop, start, logs)."""
-    allowed_actions = {"restart", "stop", "start", "logs", "inspect"}
-    if action not in allowed_actions:
-        return f"❌ Действие '{action}' не разрешено. Доступны: {', '.join(allowed_actions)}"
-    
-    try:
-        if action == "logs":
-            result = subprocess.run(
-                ["docker", "logs", "--tail", "50", container],
-                capture_output=True, text=True, timeout=15
-            )
-            output = result.stdout or result.stderr
-            return output[-3500:] if len(output) > 3500 else output
-        
-        elif action == "inspect":
-            result = subprocess.run(
-                ["docker", "inspect", "--format",
-                 "Name: {{.Name}}\nImage: {{.Config.Image}}\nStatus: {{.State.Status}}\nStarted: {{.State.StartedAt}}\nRestarts: {{.RestartCount}}",
-                 container],
-                capture_output=True, text=True, timeout=10
-            )
-            return result.stdout.strip() or result.stderr.strip()
-        
-        else:
-            result = subprocess.run(
-                ["docker", action, container],
-                capture_output=True, text=True, timeout=30
-            )
-            output = result.stdout.strip() or result.stderr.strip()
-            return output or f"✅ {action} выполнен для {container}"
-    
-    except subprocess.TimeoutExpired:
-        return f"⏰ Таймаут при выполнении {action} для {container}"
-    except Exception as e:
-        return f"❌ Ошибка: {str(e)}"
-
-def _run_server_command(command: str) -> str:
-    """Execute a shell command on the server (inside Docker host via socket)."""
-    try:
-        # Run command directly (we have access to host via docker socket)
-        result = subprocess.run(
-            command, shell=True,
-            capture_output=True, text=True, timeout=30
-        )
-        output = result.stdout.strip()
-        if result.returncode != 0:
-            output += f"\n[stderr] {result.stderr.strip()}"
-        return output[-3500:] if len(output) > 3500 else output
-    except subprocess.TimeoutExpired:
-        return "⏰ Таймаут выполнения команды (30с)"
-    except Exception as e:
-        return f"❌ Ошибка: {str(e)}"
-
-
-# ══════════════════════════════════════════════════════════
-# ██  Web Search (DuckDuckGo)
-# ══════════════════════════════════════════════════════════
-
-def _web_search(query: str, search_type: str = "general") -> str:
-    """Search the web using DuckDuckGo HTML."""
-    import urllib.request
-    import urllib.parse
-    from html.parser import HTMLParser
-    
-    try:
-        encoded_query = urllib.parse.quote_plus(query)
-        url = f"https://html.duckduckgo.com/html/?q={encoded_query}"
-        
-        req = urllib.request.Request(url, headers={
-            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"
-        })
-        
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            html = resp.read().decode("utf-8", errors="ignore")
-        
-        # Simple extraction of results
-        results = []
-        # Find result snippets between <a class="result__snippet"> tags
-        import re as _re
-        snippets = _re.findall(r'class="result__snippet"[^>]*>(.*?)</a>', html, _re.DOTALL)
-        titles = _re.findall(r'class="result__a"[^>]*>(.*?)</a>', html, _re.DOTALL)
-        urls = _re.findall(r'class="result__url"[^>]*>(.*?)</a>', html, _re.DOTALL)
-        
-        for i in range(min(5, len(snippets))):
-            title = _re.sub(r'<[^>]+>', '', titles[i]).strip() if i < len(titles) else ""
-            snippet = _re.sub(r'<[^>]+>', '', snippets[i]).strip()
-            link = _re.sub(r'<[^>]+>', '', urls[i]).strip() if i < len(urls) else ""
-            results.append(f"<b>{i+1}. {title}</b>\n{snippet}\n<i>{link}</i>")
-        
-        if results:
-            return "\n\n".join(results)
-        else:
-            return f"Не удалось найти результаты по запросу: {query}"
-    
-    except Exception as e:
-        return f"Ошибка поиска: {str(e)}"
 
 
 class SilentHTTPServer(socketserver.ThreadingMixIn, HTTPServer):
@@ -6444,6 +7463,11 @@ def main():
     app.add_handler(CommandHandler("xray", cmd_xray))
     app.add_handler(CallbackQueryHandler(callback_delete, pattern=r"^del:"))
     app.add_handler(CallbackQueryHandler(callback_book, pattern=r"^book:"))
+    app.add_handler(CallbackQueryHandler(callback_audiobook, pattern=r"^abook:"))
+    app.add_handler(CommandHandler("projects", cmd_projects))
+    app.add_handler(CallbackQueryHandler(callback_project, pattern=r"^proj:"))
+    app.add_handler(CommandHandler("finance", cmd_finance))
+    app.add_handler(CallbackQueryHandler(callback_finance, pattern=r"^fin:"))
     app.add_handler(CallbackQueryHandler(callback_bookdev, pattern=r"^bookdev:"))
     app.add_handler(CallbackQueryHandler(callback_urlkindle, pattern=r"^urlkindle:"))
 
@@ -6590,9 +7614,6 @@ def main():
         _last_briefing_date = ""
         _last_review_week = ""
         
-        # Wait 60s after startup for CalDAV client to initialize
-        await asyncio.sleep(60)
-        
         while True:
             try:
                 await asyncio.sleep(30)
@@ -6698,7 +7719,8 @@ def main():
                                 try:
                                     brief = await asyncio.to_thread(_prepare_meeting_brief, first_event["title"])
                                     if brief and len(brief) > 20:
-                                        msg += f"📋 <b>К событию \"{first_event["title"]}\":</b>\n<i>{brief[:300]}</i>\n\n"
+                                        evt_title = first_event['title']
+                                        msg += f"📋 <b>К событию \"{evt_title}\":</b>\n<i>{brief[:300]}</i>\n\n"
                                 except Exception:
                                     pass
                         
