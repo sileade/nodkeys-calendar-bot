@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Nodkeys Calendar & Life Bot v8.1
+Nodkeys Calendar & Life Bot v8.2
 Telegram bot that analyzes messages using Claude AI and routes them:
 - Events/Tasks/Reminders → Apple Calendar (iCloud CalDAV)
 - Notes → Apple Notes (iCloud IMAP)
@@ -3405,33 +3405,23 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="HTML"
             )
             return
-            cat_tag = CATEGORY_TAG_MAP.get(category_key, "👤 [Личное]")
-            original_title = data.get("title", "")
-            if not any(tag in original_title for tag in ["[Личное]", "[Дом]", "[Работа]", "[Долгосрочные]"]):
-                data["title"] = f"{cat_tag} {original_title}"
-            
-            uid = await asyncio.to_thread(create_calendar_event, data)
-            if uid:
-                type_map = {"event": "📅 Событие", "task": "✅ Задача", "reminder": "🔔 Напоминание"}
-                cal_map = {"work": "💼 Рабочий", "family": "🏠 Семейный", "reminders": "⚠️ Напоминания"}
-                response_text = (
-                    f"🎤 <b>Голосовое → Календарь!</b>\n\n"
-                    f"<b>Текст:</b> <i>{transcribed_text[:200]}</i>\n\n"
-                    f"<b>Тип:</b> {type_map.get(entry_type, entry_type)}\n"
-                    f"<b>Название:</b> {data.get('title', '?')}\n"
-                    f"<b>Дата:</b> {data.get('date', '?')}\n"
-                    f"<b>Календарь:</b> {cal_map.get(data.get('calendar', ''), '')}\n"
-                    f"\n🗑 <i>Ответьте «удали» чтобы удалить</i>"
-                )
-                await thinking.edit_text(response_text, parse_mode="HTML")
-                _event_store[thinking.message_id] = {"uid": uid, "calendar": data.get("calendar", "reminders")}
-                _save_event_store()
-            else:
-                await thinking.edit_text("❌ Не удалось создать запись в календаре")
         
-        elif entry_type == "note":
-            title = data.get("title", "Заметка")
-            note_content = data.get("content", data.get("description", transcribed_text))
+        # ── Voice: dispatch all other tools via unified handler ──
+        if tool_name == "save_memory":
+            fact = tool_input.get("fact", "")
+            if fact:
+                await asyncio.to_thread(_add_memory_fact, fact)
+                await thinking.edit_text(
+                    f"🎤🧠 <b>Распознано и запомнил!</b>\n\n"
+                    f"<i>{transcribed_text[:200]}</i>\n\n"
+                    f"💾 {fact}",
+                    parse_mode="HTML"
+                )
+            return
+        
+        if tool_name == "create_note":
+            title = tool_input.get("title", "Заметка")
+            note_content = tool_input.get("content", transcribed_text)
             html_body = f"<html><head></head><body><div>{note_content.replace(chr(10), '<br>')}</div></body></html>"
             success = await asyncio.to_thread(create_apple_note, title, html_body)
             if success:
@@ -3443,9 +3433,10 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
             else:
                 await thinking.edit_text("❌ Не удалось создать заметку")
+            return
         
-        elif entry_type == "diary":
-            diary_content = data.get("content", transcribed_text)
+        if tool_name == "create_diary_entry":
+            diary_content = tool_input.get("content", transcribed_text)
             success = await asyncio.to_thread(create_diary_entry, diary_content)
             if success:
                 await thinking.edit_text(
@@ -3454,11 +3445,73 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
             else:
                 await thinking.edit_text("❌ Не удалось добавить в дневник")
-        else:
+            return
+        
+        if tool_name == "create_calendar_event":
+            # Map tool_input to existing event creation format
+            user_routing_v = get_user_routing(msg.from_user)
+            data_mapped = {
+                "action": "create",
+                "type": tool_input.get("event_type", "event"),
+                "calendar": tool_input.get("calendar", "family"),
+                "category": tool_input.get("category", "personal"),
+                "title": tool_input.get("title", ""),
+                "description": tool_input.get("description", ""),
+                "date": tool_input.get("date", datetime.now(TIMEZONE).strftime("%Y-%m-%d")),
+                "time_start": tool_input.get("time_start"),
+                "time_end": tool_input.get("time_end"),
+                "all_day": tool_input.get("all_day", True),
+                "alarm_minutes": tool_input.get("alarm_minutes", 30),
+                "confidence": 0.95,
+            }
+            data_mapped = apply_calendar_override(data_mapped, user_routing_v)
+            
+            uid = await asyncio.to_thread(create_calendar_event, data_mapped)
+            if uid:
+                type_map = {"event": "📅 Событие", "task": "✅ Задача", "reminder": "🔔 Напоминание"}
+                cal_map = {"work": "💼 Рабочий", "family": "🏠 Семейный", "reminders": "⚠️ Напоминания"}
+                evt_type = data_mapped.get("type", "event")
+                response_text = (
+                    f"🎤 <b>Голосовое → Календарь!</b>\n\n"
+                    f"<b>Текст:</b> <i>{transcribed_text[:200]}</i>\n\n"
+                    f"<b>Тип:</b> {type_map.get(evt_type, evt_type)}\n"
+                    f"<b>Название:</b> {data_mapped.get('title', '?')}\n"
+                    f"<b>Дата:</b> {data_mapped.get('date', '?')}\n"
+                    f"<b>Календарь:</b> {cal_map.get(data_mapped.get('calendar', ''), '')}\n"
+                    f"\n🗑 <i>Ответьте «удали» чтобы удалить</i>"
+                )
+                await thinking.edit_text(response_text, parse_mode="HTML")
+                _event_store[thinking.message_id] = {"uid": uid, "calendar": data_mapped.get("calendar", "reminders")}
+                _save_event_store()
+            else:
+                await thinking.edit_text("❌ Не удалось создать запись в календаре")
+            return
+        
+        if tool_name == "mark_habit_done":
+            habit_name = tool_input.get("habit_name", "")
             await thinking.edit_text(
-                f"🎤 <b>Распознано:</b>\n<i>{transcribed_text[:500]}</i>",
+                f"🎤 <b>Распознано:</b> <i>{transcribed_text[:200]}</i>\n\n✅ Отмечаю привычку...",
                 parse_mode="HTML"
             )
+            await _handle_habit_done(habit_name, thinking, chat_id)
+            return
+        
+        if tool_name == "web_search":
+            query = tool_input.get("query", "")
+            await thinking.edit_text(f"🎤🔍 <b>Ищу:</b> {query}...", parse_mode="HTML")
+            try:
+                results = await asyncio.to_thread(_web_search, query)
+                response = f"🎤 <b>Распознано:</b> <i>{transcribed_text[:150]}</i>\n\n🌐 <b>Результаты:</b>\n\n{results}"
+                await thinking.edit_text(response[:4000], parse_mode="HTML")
+            except Exception as e:
+                await thinking.edit_text(f"❌ Ошибка поиска: {str(e)[:100]}")
+            return
+        
+        # ── Fallback: show transcription ──
+        await thinking.edit_text(
+            f"🎤 <b>Распознано:</b>\n<i>{transcribed_text[:500]}</i>",
+            parse_mode="HTML"
+        )
     
     except Exception as e:
         logger.error("Voice handler error: %s", e)
@@ -3899,7 +3952,7 @@ async def handle_location(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ══════════════════════════════════════════════════════════
 # ██  YouTube Summarization
 # ══════════════════════════════════════════════════════════
-def _summarize_youtube(url: str) -> str:
+def _summarize_youtube(url: str, question: str = "summary") -> str:
     """Summarize a YouTube video using transcript/subtitles + Claude."""
     import urllib.request
     import urllib.parse
@@ -4707,6 +4760,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
 
     original_text = update.message.text or ''
+    
+    # ═══ Check pending dialog state ═══
+    if chat_id in _dialog_state:
+        state = _dialog_state[chat_id]
+        if _time.time() < state.get("expires", 0):
+            # Append context to the message for Claude
+            pending_context = state.get("context", "")
+            if pending_context:
+                # Combine pending context with new message for better analysis
+                text = f"[Контекст предыдущего вопроса: {pending_context}] {text}"
+            del _dialog_state[chat_id]
+        else:
+            # Expired - remove stale state
+            del _dialog_state[chat_id]
+    
     # ═══ Tool Calling Dispatch ═══
     tool_name = data.get("tool_name", "")
     tool_input = data.get("tool_input", {})
@@ -4717,7 +4785,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if tool_name == "chat_response":
         response_msg = tool_input.get("message", "")
         if response_msg:
-            await thinking_msg.edit_text(response_msg, parse_mode="HTML")
+            try:
+                await thinking_msg.edit_text(response_msg, parse_mode="HTML")
+            except Exception:
+                # HTML parse error - send without formatting
+                import html as _html_mod
+                clean_msg = _html_mod.unescape(response_msg)
+                # Remove any broken HTML tags
+                clean_msg = re.sub(r'<[^>]*$', '', clean_msg)
+                try:
+                    await thinking_msg.edit_text(clean_msg)
+                except Exception:
+                    await thinking_msg.edit_text(response_msg[:4000])
         else:
             await thinking_msg.edit_text("👍")
         return
@@ -6510,6 +6589,9 @@ def main():
         bot = app_instance.bot
         _last_briefing_date = ""
         _last_review_week = ""
+        
+        # Wait 60s after startup for CalDAV client to initialize
+        await asyncio.sleep(60)
         
         while True:
             try:
