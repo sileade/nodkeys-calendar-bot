@@ -6975,6 +6975,7 @@ class HealthHandler(BaseHTTPRequestHandler):
                 kindle_stats = {}
             data = {
                 "status": "ok",
+                "version": VERSION,
                 "bot": f"Nodkeys Calendar & Life Bot v{VERSION}",
                 "uptime_seconds": int(uptime),
                 "messages_processed": _messages_processed,
