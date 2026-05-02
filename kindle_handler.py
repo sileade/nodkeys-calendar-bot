@@ -7,6 +7,7 @@ converts if necessary using Calibre, and sends to Kindle via iCloud SMTP.
 import os
 import re
 import json
+import hashlib
 import logging
 import smtplib
 import subprocess
@@ -35,6 +36,97 @@ SMTP_LOGIN = os.getenv("ICLOUD_USERNAME", EMAIL_FROM)  # Use iCloud username for
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 TMP_DIR = os.getenv("KINDLE_TMP_DIR", "/tmp/kindle_files")
 BOOKS_STORAGE_DIR = os.getenv("KINDLE_BOOKS_STORAGE", "/app/data/books")
+
+# ──────────────────── S3 Configuration ────────────────────
+S3_ENDPOINT_URL = os.getenv("S3_ENDPOINT_URL", "")
+S3_ACCESS_KEY = os.getenv("S3_ACCESS_KEY", "")
+S3_SECRET_KEY = os.getenv("S3_SECRET_KEY", "")
+S3_BOOKS_BUCKET = os.getenv("S3_BOOKS_BUCKET", "books")
+
+
+def _get_s3_client():
+    """Get S3 client for book storage."""
+    if not S3_ENDPOINT_URL or not S3_ACCESS_KEY:
+        return None
+    try:
+        import boto3
+        from botocore.config import Config
+        return boto3.client(
+            "s3",
+            endpoint_url=S3_ENDPOINT_URL,
+            aws_access_key_id=S3_ACCESS_KEY,
+            aws_secret_access_key=S3_SECRET_KEY,
+            region_name="us-east-1",
+            config=Config(signature_version="s3v4"),
+        )
+    except Exception as e:
+        logger.error("S3 client error: %s", e)
+        return None
+
+
+def _book_hash(filename: str, file_size: int) -> str:
+    """Generate a unique hash for a book based on filename and size."""
+    key = f"{filename}:{file_size}"
+    return hashlib.sha256(key.encode()).hexdigest()[:16]
+
+
+def _upload_book_to_s3(book_hash: str, file_path: str, filename: str) -> str:
+    """Upload a book file to S3. Returns S3 key or empty string."""
+    s3 = _get_s3_client()
+    if not s3:
+        return ""
+    try:
+        s3_key = f"{book_hash}/{filename}"
+        s3.upload_file(file_path, S3_BOOKS_BUCKET, s3_key)
+        logger.info("Book uploaded to S3: %s", s3_key)
+        return s3_key
+    except Exception as e:
+        logger.error("S3 book upload error: %s", e)
+        return ""
+
+
+def _download_book_from_s3(s3_key: str, local_path: str) -> bool:
+    """Download a book file from S3."""
+    s3 = _get_s3_client()
+    if not s3:
+        return False
+    try:
+        os.makedirs(os.path.dirname(local_path), exist_ok=True)
+        s3.download_file(S3_BOOKS_BUCKET, s3_key, local_path)
+        return True
+    except Exception as e:
+        logger.error("S3 book download error: %s", e)
+        return False
+
+
+def _check_book_s3_cache(book_hash: str) -> list:
+    """Check if book files exist in S3 cache. Returns list of S3 keys."""
+    s3 = _get_s3_client()
+    if not s3:
+        return []
+    try:
+        resp = s3.list_objects_v2(Bucket=S3_BOOKS_BUCKET, Prefix=f"{book_hash}/")
+        contents = resp.get('Contents', [])
+        return [obj['Key'] for obj in contents] if contents else []
+    except Exception as e:
+        logger.error("S3 book cache check error: %s", e)
+        return []
+
+
+def _ensure_books_bucket():
+    """Ensure the books S3 bucket exists."""
+    s3 = _get_s3_client()
+    if not s3:
+        return
+    try:
+        s3.head_bucket(Bucket=S3_BOOKS_BUCKET)
+    except Exception:
+        try:
+            s3.create_bucket(Bucket=S3_BOOKS_BUCKET)
+            logger.info("Created S3 bucket: %s", S3_BOOKS_BUCKET)
+        except Exception as e:
+            logger.warning("Could not create bucket %s: %s", S3_BOOKS_BUCKET, e)
+
 
 # Formats Kindle accepts directly (no conversion needed)
 KINDLE_NATIVE_FORMATS = {
@@ -88,8 +180,8 @@ def _save_books_history():
         logger.error("Failed to save books history: %s", e)
 
 
-def store_book_file(file_path: str, book_id: int) -> str:
-    """Copy book file to permanent storage. Returns stored path."""
+def store_book_file(file_path: str, book_id: int, book_hash: str = "") -> str:
+    """Copy book file to permanent storage and upload to S3. Returns stored path."""
     try:
         import shutil
         os.makedirs(BOOKS_STORAGE_DIR, exist_ok=True)
@@ -97,7 +189,14 @@ def store_book_file(file_path: str, book_id: int) -> str:
         stored_name = f"{book_id:04d}_{Path(file_path).stem}{ext}"
         stored_path = os.path.join(BOOKS_STORAGE_DIR, stored_name)
         shutil.copy2(file_path, stored_path)
-        logger.info("Book stored: %s", stored_path)
+        logger.info("Book stored locally: %s", stored_path)
+        
+        # Upload to S3
+        if book_hash:
+            s3_key = _upload_book_to_s3(book_hash, file_path, os.path.basename(file_path))
+            if s3_key:
+                logger.info("Book stored in S3: %s", s3_key)
+        
         return stored_name
     except Exception as e:
         logger.error("Failed to store book: %s", e)
@@ -107,7 +206,8 @@ def store_book_file(file_path: str, book_id: int) -> str:
 def add_book_to_history(filename: str, title: str, author: str, 
                         format_from: str, format_to: str,
                         kindle_email: str, converted: bool, 
-                        file_size: int, stored_file: str = ""):
+                        file_size: int, stored_file: str = "",
+                        book_hash: str = "", s3_key: str = ""):
     """Add a book entry to the history."""
     from datetime import datetime
     entry = {
@@ -123,6 +223,8 @@ def add_book_to_history(filename: str, title: str, author: str,
         "sent_at": datetime.now().isoformat(),
         "status": "sent",
         "stored_file": stored_file,
+        "book_hash": book_hash,
+        "s3_key": s3_key,
     }
     _books_history.append(entry)
     _save_books_history()
@@ -138,6 +240,9 @@ def get_books_history() -> list:
 
 # Load history on module import
 _load_books_history()
+
+# Ensure S3 bucket exists on module import
+_ensure_books_bucket()
 
 
 def get_kindle_devices() -> list:
@@ -517,6 +622,9 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=reply_markup,
     )
 
+    # Generate book hash for S3 caching
+    bhash = _book_hash(filename, file_size)
+
     # Store file info in context for callback
     context.user_data["kindle_file"] = {
         "file_id": doc.file_id,
@@ -526,6 +634,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "needs_conversion": needs_conversion,
         "recommended_output": recommended if recommended != "direct" else None,
         "ai_result": ai_result,
+        "book_hash": bhash,
     }
 
 
@@ -616,20 +725,31 @@ async def callback_kindle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         success, error_msg = send_email_to_kindle(send_path, kindle_email, subject)
 
         if success:
-            result_text = "✅ <b>Отправлено на Kindle!</b>\n\n"
-            result_text += f"📄 <b>Файл:</b> {os.path.basename(send_path)}\n"
+            # Upload to S3 for persistent storage
+            bhash = file_info.get("book_hash", "")
+            s3_key = ""
+            if bhash:
+                s3_key = _upload_book_to_s3(bhash, send_path, os.path.basename(send_path))
+                # Also upload original if converted
+                if converted and local_path != send_path:
+                    _upload_book_to_s3(bhash, local_path, os.path.basename(local_path))
+
+            result_text = "\u2705 <b>\u041e\u0442\u043f\u0440\u0430\u0432\u043b\u0435\u043d\u043e \u043d\u0430 Kindle!</b>\n\n"
+            result_text += f"\U0001f4c4 <b>\u0424\u0430\u0439\u043b:</b> {os.path.basename(send_path)}\n"
             if title:
-                result_text += f"📕 <b>Название:</b> {title}\n"
+                result_text += f"\U0001f4d5 <b>\u041d\u0430\u0437\u0432\u0430\u043d\u0438\u0435:</b> {title}\n"
             if author:
-                result_text += f"✍️ <b>Автор:</b> {author}\n"
-            result_text += f"📱 <b>Устройство:</b> {kindle_email}\n"
+                result_text += f"\u270d\ufe0f <b>\u0410\u0432\u0442\u043e\u0440:</b> {author}\n"
+            result_text += f"\U0001f4f1 <b>\u0423\u0441\u0442\u0440\u043e\u0439\u0441\u0442\u0432\u043e:</b> {kindle_email}\n"
             if converted:
-                result_text += f"🔄 <b>Конвертировано:</b> {file_info['file_ext'].upper()} → {file_info['recommended_output'].upper()}\n"
-            result_text += "\n📬 <i>Книга появится на Kindle через 1-5 минут</i>"
+                result_text += f"\U0001f504 <b>\u041a\u043e\u043d\u0432\u0435\u0440\u0442\u0438\u0440\u043e\u0432\u0430\u043d\u043e:</b> {file_info['file_ext'].upper()} \u2192 {file_info['recommended_output'].upper()}\n"
+            if s3_key:
+                result_text += f"\U0001f4be <b>S3:</b> \u0421\u043e\u0445\u0440\u0430\u043d\u0435\u043d\u043e \u0432 \u043e\u0431\u043b\u0430\u043a\u043e\n"
+            result_text += "\n\U0001f4ec <i>\u041a\u043d\u0438\u0433\u0430 \u043f\u043e\u044f\u0432\u0438\u0442\u0441\u044f \u043d\u0430 Kindle \u0447\u0435\u0440\u0435\u0437 1-5 \u043c\u0438\u043d\u0443\u0442</i>"
 
             # Store book file permanently
             book_id = len(_books_history) + 1
-            stored_file = store_book_file(send_path, book_id)
+            stored_file = store_book_file(send_path, book_id, book_hash=bhash)
 
             # Track in books history
             add_book_to_history(
@@ -642,6 +762,8 @@ async def callback_kindle(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 converted=converted,
                 file_size=file_info['file_size'],
                 stored_file=stored_file,
+                book_hash=bhash,
+                s3_key=s3_key,
             )
 
             await query.edit_message_text(result_text, parse_mode="HTML")
