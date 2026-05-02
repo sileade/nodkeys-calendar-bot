@@ -3384,35 +3384,27 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
             , parse_mode="HTML")
             return
         
-        if data.get("action") == "skip":
+        # Voice: show transcription, then dispatch via Tool Calling
+        tool_name = data.get("tool_name", "")
+        tool_input = data.get("tool_input", {})
+        
+        if tool_name == "chat_response":
+            msg_text = tool_input.get("message", "Не удалось обработать")
             await thinking.edit_text(
                 f"🎤 <b>Распознано:</b>\n<i>{transcribed_text[:300]}</i>\n\n"
-                f"🤔 <b>Не создаю запись</b>\n💭 <i>{data.get('reasoning', '')}</i>",
+                f"💬 {msg_text}",
                 parse_mode="HTML"
             )
             return
         
-        confidence_val = data.get("confidence", 0)
-        if confidence_val < 0.4:
+        if tool_name == "ask_clarification":
+            question = tool_input.get("question", "Уточните запрос")
             await thinking.edit_text(
                 f"🎤 <b>Распознано:</b>\n<i>{transcribed_text[:300]}</i>\n\n"
-                f"⚠️ Низкая уверенность ({confidence_val:.0%})",
+                f"❓ {question}",
                 parse_mode="HTML"
             )
             return
-        
-        entry_type = data.get("type", "")
-        data = apply_calendar_override(data, user_routing)
-        
-        # Add category tag for calendar events
-        if entry_type in ("event", "task", "reminder"):
-            category_key = data.get("category", "personal")
-            CATEGORY_TAG_MAP = {
-                "personal": "👤 [Личное]",
-                "home": "🏠 [Дом]",
-                "work": "💼 [Работа]",
-                "longterm": "🎯 [Долгосрочные]",
-            }
             cat_tag = CATEGORY_TAG_MAP.get(category_key, "👤 [Личное]")
             original_title = data.get("title", "")
             if not any(tag in original_title for tag in ["[Личное]", "[Дом]", "[Работа]", "[Долгосрочные]"]):
