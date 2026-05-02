@@ -5,6 +5,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY *.py .
+COPY *.html .
 # Create directories for temp files and persistent data
 RUN mkdir -p /tmp/kindle_files /app/data/books
 # Persistent data volume
