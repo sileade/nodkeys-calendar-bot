@@ -15,7 +15,7 @@ Telegram bot that analyzes messages using Claude AI and routes them:
 - All through natural language — no commands needed
 """
 
-VERSION = "9.4"
+VERSION = "9.5"
 
 import os
 import re
@@ -1396,7 +1396,7 @@ async def audiobook_download_pipeline(
     cache[info_hash] = {
         'title': title,
         's3_prefix': f"{info_hash}/",
-        'files': [f['filename'] for f in uploaded],
+        'files': [{'filename': f['filename'], 'key': f['key'], 'size': f['size']} for f in uploaded],
         'total_size': sum(f['size'] for f in uploaded),
         'timestamp': datetime.now(TIMEZONE).isoformat(),
     }
@@ -7990,7 +7990,8 @@ h3 { margin: 4px 8px 8px; color: #4ade80; font-size: 14px; border-bottom: 1px so
                     self.wfile.write(b'<html><body style="background:#1a1c2e;color:#e0e0e0;font-family:sans-serif;padding:20px"><h2>Audiobook not found in cache</h2></body></html>')
                     return
                 title = entry.get('title', 'Audiobook')
-                files = sorted(entry.get('files', []))
+                raw_files = entry.get('files', [])
+                files = sorted([f['filename'] if isinstance(f, dict) else f for f in raw_files])
                 total_size = entry.get('total_size', 0)
                 html = f'''<!DOCTYPE html>
 <html><head><meta charset="utf-8"><title>{title}</title>
@@ -8034,10 +8035,29 @@ a.dl:hover {{ background: #4ade80; color: #1a1c2e; }}
                 # Prevent path traversal
                 if '..' in filename:
                     raise ValueError('Invalid filename')
-                s3_key = f'{info_hash}/{filename}'
                 s3 = _get_s3_client()
                 if not s3:
                     raise RuntimeError('S3 not available')
+                # Find real S3 key (files may be in subfolders)
+                s3_key = None
+                cache = _load_audiobook_cache()
+                entry = cache.get(info_hash)
+                if entry and entry.get('files'):
+                    for f in entry['files']:
+                        if isinstance(f, dict) and f.get('filename') == filename:
+                            s3_key = f['key']
+                            break
+                if not s3_key:
+                    try:
+                        list_resp = s3.list_objects_v2(Bucket=S3_BUCKET, Prefix=f'{info_hash}/')
+                        for obj in list_resp.get('Contents', []):
+                            if obj['Key'].endswith(f'/{filename}'):
+                                s3_key = obj['Key']
+                                break
+                    except Exception:
+                        pass
+                if not s3_key:
+                    raise FileNotFoundError(f'File {filename} not found in S3')
                 # Stream from S3
                 resp = s3.get_object(Bucket=S3_BUCKET, Key=s3_key)
                 file_size = resp['ContentLength']
@@ -8109,8 +8129,11 @@ a.dl:hover {{ background: #4ade80; color: #1a1c2e; }}
                         pass
                 if not files_list:
                     # Fallback to cache file list
-                    for fname in entry.get('files', []):
-                        files_list.append({'filename': fname, 'size': 0})
+                    for f in entry.get('files', []):
+                        if isinstance(f, dict):
+                            files_list.append({'filename': f.get('filename', ''), 'size': f.get('size', 0), 'key': f.get('key', '')})
+                        else:
+                            files_list.append({'filename': f, 'size': 0})
                 files_list.sort(key=lambda x: x['filename'])
                 data = {
                     'title': entry.get('title', 'Audiobook'),
@@ -8141,10 +8164,34 @@ a.dl:hover {{ background: #4ade80; color: #1a1c2e; }}
                     raise ValueError('Invalid path')
                 if '..' in filename:
                     raise ValueError('Invalid filename')
-                s3_key = f'{info_hash}/{filename}'
                 s3 = _get_s3_client()
                 if not s3:
                     raise RuntimeError('S3 not available')
+                # Try to find the real S3 key - files may be in subfolders
+                s3_key = None
+                # First try cache
+                cache = _load_audiobook_cache()
+                entry = cache.get(info_hash)
+                if entry and entry.get('files'):
+                    for f in entry['files']:
+                        if isinstance(f, dict) and f.get('filename') == filename:
+                            s3_key = f['key']
+                            break
+                        elif isinstance(f, str) and f == filename:
+                            # Old format - try with prefix
+                            pass
+                if not s3_key:
+                    # Search S3 for the file
+                    try:
+                        list_resp = s3.list_objects_v2(Bucket=S3_BUCKET, Prefix=f'{info_hash}/')
+                        for obj in list_resp.get('Contents', []):
+                            if obj['Key'].endswith(f'/{filename}'):
+                                s3_key = obj['Key']
+                                break
+                    except Exception:
+                        pass
+                if not s3_key:
+                    raise FileNotFoundError(f'File {filename} not found in S3')
                 resp = s3.get_object(Bucket=S3_BUCKET, Key=s3_key)
                 file_size = resp['ContentLength']
                 ext = os.path.splitext(filename)[1].lower()
