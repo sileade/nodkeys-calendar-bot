@@ -1149,32 +1149,57 @@ def _qbt_get_torrent_files(info_hash: str) -> list[dict]:
 
 
 def _upload_audiobook_to_s3(info_hash: str, local_dir: str) -> list[dict]:
-    """Upload audio files from local directory to S3.
+    """Upload audio files from local directory to S3 using parallel threads.
     Returns list of {key, size, filename}."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
     s3 = _get_s3_client()
     if not s3:
         return []
+
+    # Collect files to upload
+    files_to_upload = []
+    for root, dirs, files in os.walk(local_dir):
+        for fname in sorted(files):
+            ext = os.path.splitext(fname)[1].lower()
+            if ext not in AUDIO_EXTENSIONS:
+                continue
+            local_path = os.path.join(root, fname)
+            rel_path = os.path.relpath(local_path, local_dir)
+            s3_key = f"{info_hash}/{rel_path}"
+            file_size = os.path.getsize(local_path)
+            files_to_upload.append((local_path, s3_key, file_size, fname))
+
+    if not files_to_upload:
+        return []
+
+    logger.info("S3 upload: %d files to upload for %s", len(files_to_upload), info_hash)
     uploaded = []
-    try:
-        for root, dirs, files in os.walk(local_dir):
-            for fname in sorted(files):
-                ext = os.path.splitext(fname)[1].lower()
-                if ext not in AUDIO_EXTENSIONS:
-                    continue
-                local_path = os.path.join(root, fname)
-                # Preserve relative path structure
-                rel_path = os.path.relpath(local_path, local_dir)
-                s3_key = f"{info_hash}/{rel_path}"
-                file_size = os.path.getsize(local_path)
-                logger.info("Uploading to S3: %s (%d bytes)", s3_key, file_size)
-                s3.upload_file(local_path, S3_BUCKET, s3_key)
-                uploaded.append({
-                    'key': s3_key,
-                    'size': file_size,
-                    'filename': fname,
-                })
-    except Exception as e:
-        logger.error("S3 upload error: %s", e)
+    failed = 0
+
+    def _upload_one(item):
+        local_path, s3_key, file_size, fname = item
+        try:
+            # Each thread needs its own S3 client
+            thread_s3 = _get_s3_client()
+            thread_s3.upload_file(local_path, S3_BUCKET, s3_key)
+            return {'key': s3_key, 'size': file_size, 'filename': fname}
+        except Exception as e:
+            logger.error("S3 upload error for %s: %s", s3_key, e)
+            return None
+
+    # Use 8 parallel threads for upload
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futures = {pool.submit(_upload_one, item): item for item in files_to_upload}
+        for future in as_completed(futures):
+            result = future.result()
+            if result:
+                uploaded.append(result)
+            else:
+                failed += 1
+
+    # Sort by filename for consistent ordering
+    uploaded.sort(key=lambda x: x['filename'])
+    logger.info("S3 upload done: %d uploaded, %d failed", len(uploaded), failed)
     return uploaded
 
 
