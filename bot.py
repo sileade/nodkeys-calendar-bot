@@ -15,7 +15,7 @@ Telegram bot that analyzes messages using Claude AI and routes them:
 - All through natural language — no commands needed
 """
 
-VERSION = "9.3"
+VERSION = "9.4"
 
 import os
 import re
@@ -39,7 +39,7 @@ from urllib.request import Request, urlopen
 
 import anthropic
 import caldav
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -961,6 +961,15 @@ AUDIOBOOK_CACHE_FILE = "/app/data/audiobook_cache.json"
 AUDIO_EXTENSIONS = {".mp3", ".m4a", ".m4b", ".ogg", ".opus", ".flac", ".wav", ".aac", ".wma"}
 TELEGRAM_MAX_AUDIO_SIZE = 49 * 1024 * 1024  # 49MB (Telegram limit ~50MB)
 
+# Mini App player HTML — loaded from file at startup
+_AUDIOBOOK_PLAYER_HTML = ""
+_player_html_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'audiobook_player.html')
+if os.path.exists(_player_html_path):
+    with open(_player_html_path, 'r', encoding='utf-8') as _f:
+        _AUDIOBOOK_PLAYER_HTML = _f.read()
+else:
+    logger.warning('audiobook_player.html not found at %s', _player_html_path)
+
 # S3 client (lazy init)
 _s3_client = None
 
@@ -1240,14 +1249,26 @@ async def audiobook_download_pipeline(
     cached_files = await asyncio.to_thread(_check_s3_cache, info_hash)
 
     if cached_files:
-        # Found in cache — send directly from S3
+        # Found in cache — send Mini App button
+        webapp_url = f"https://bot.nodkeys.com/audiobook/player?hash={info_hash}"
+        download_url = f"https://bot.nodkeys.com/audiobook/download/{info_hash}"
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton(
+                "\U0001f3a7 Открыть плеер",
+                web_app=WebAppInfo(url=webapp_url),
+            )],
+            [InlineKeyboardButton(
+                "\U0001f4e5 Скачать все файлы",
+                url=download_url,
+            )],
+        ])
         await _edit(
-            f"✅ <b>Найдено в кэше!</b>\n\n"
-            f"🎧 {title[:60]}\n"
-            f"📁 {len(cached_files)} аудиофайлов\n\n"
-            f"📤 Отправляю..."
+            f"\u2705 <b>Аудиокнига готова!</b>\n\n"
+            f"\U0001f3a7 {title[:60]}\n"
+            f"\U0001f4c1 {len(cached_files)} аудиофайлов ({_format_size(sum(f['size'] for f in cached_files))})\n\n"
+            f"\U0001f4a1 Нажмите <b>\"Открыть плеер\"</b> для прослушивания прямо в Telegram.",
+            reply_markup=keyboard,
         )
-        await _send_audio_files_from_s3(bot, chat_id, cached_files, title, info_hash=info_hash)
         return
 
     # ── Step 2: Add to qBittorrent ──
@@ -1381,14 +1402,26 @@ async def audiobook_download_pipeline(
     }
     _save_audiobook_cache(cache)
 
-    # ── Step 5: Send audio files to Telegram ──
+    # ── Step 5: Send Mini App button ──
+    webapp_url = f"https://bot.nodkeys.com/audiobook/player?hash={info_hash}"
+    download_url = f"https://bot.nodkeys.com/audiobook/download/{info_hash}"
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            "\U0001f3a7 Открыть плеер",
+            web_app=WebAppInfo(url=webapp_url),
+        )],
+        [InlineKeyboardButton(
+            "\U0001f4e5 Скачать все файлы",
+            url=download_url,
+        )],
+    ])
     await _edit(
-        f"✅ <b>Скачано и закэшировано!</b>\n\n"
-        f"🎧 {title[:60]}\n"
-        f"📁 {len(uploaded)} файлов ({_format_size(sum(f['size'] for f in uploaded))})\n\n"
-        f"📤 Отправляю аудиофайлы..."
+        f"\u2705 <b>Скачано и закэшировано!</b>\n\n"
+        f"\U0001f3a7 {title[:60]}\n"
+        f"\U0001f4c1 {len(uploaded)} файлов ({_format_size(sum(f['size'] for f in uploaded))})\n\n"
+        f"\U0001f4a1 Нажмите <b>\"Открыть плеер\"</b> для прослушивания прямо в Telegram.",
+        reply_markup=keyboard,
     )
-    await _send_audio_files_from_s3(bot, chat_id, uploaded, title, info_hash=info_hash)
 
     # Clean up torrent (optional: pause seeding)
     try:
@@ -8029,6 +8062,115 @@ a.dl:hover {{ background: #4ade80; color: #1a1c2e; }}
                     self.send_header('Content-Type', 'text/html; charset=utf-8')
                     self.end_headers()
                     self.wfile.write(f'<html><body style="background:#1a1c2e;color:#e0e0e0;font-family:sans-serif;padding:20px">File not found: {e}</body></html>'.encode())
+                except Exception:
+                    pass
+        elif self.path.startswith('/audiobook/player'):
+            # Telegram Mini App — audiobook player
+            try:
+                html = _AUDIOBOOK_PLAYER_HTML
+                self.send_response(200)
+                self.send_header('Content-Type', 'text/html; charset=utf-8')
+                self.send_header('Access-Control-Allow-Origin', '*')
+                self.send_header('Cache-Control', 'public, max-age=3600')
+                self.end_headers()
+                self.wfile.write(html.encode())
+            except Exception as e:
+                self.send_response(500)
+                self.send_header('Content-Type', 'text/html; charset=utf-8')
+                self.end_headers()
+                self.wfile.write(f'<html><body>Error: {e}</body></html>'.encode())
+        elif self.path.startswith('/audiobook/api/'):
+            # JSON API — list audiobook files for Mini App
+            try:
+                info_hash = self.path.split('/audiobook/api/')[1].split('/')[0].split('?')[0].strip()
+                if not re.match(r'^[a-f0-9]{40}$', info_hash):
+                    raise ValueError('Invalid info_hash')
+                cache = _load_audiobook_cache()
+                entry = cache.get(info_hash)
+                if not entry:
+                    self.send_response(404)
+                    self.send_header('Content-Type', 'application/json')
+                    self.send_header('Access-Control-Allow-Origin', '*')
+                    self.end_headers()
+                    self.wfile.write(json.dumps({'error': 'not_found'}).encode())
+                    return
+                # Build file list with sizes from S3 or cache
+                files_list = []
+                s3 = _get_s3_client()
+                if s3:
+                    try:
+                        resp = s3.list_objects_v2(Bucket=S3_BUCKET, Prefix=f'{info_hash}/')
+                        for obj in resp.get('Contents', []):
+                            fname = obj['Key'].split('/')[-1]
+                            ext = os.path.splitext(fname)[1].lower()
+                            if ext in AUDIO_EXTENSIONS:
+                                files_list.append({'filename': fname, 'size': obj['Size'], 'key': obj['Key']})
+                    except Exception:
+                        pass
+                if not files_list:
+                    # Fallback to cache file list
+                    for fname in entry.get('files', []):
+                        files_list.append({'filename': fname, 'size': 0})
+                files_list.sort(key=lambda x: x['filename'])
+                data = {
+                    'title': entry.get('title', 'Audiobook'),
+                    'info_hash': info_hash,
+                    'files': files_list,
+                    'total_size': entry.get('total_size', sum(f['size'] for f in files_list)),
+                    'total_files': len(files_list),
+                }
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json')
+                self.send_header('Access-Control-Allow-Origin', '*')
+                self.end_headers()
+                self.wfile.write(json.dumps(data, ensure_ascii=False).encode())
+            except Exception as e:
+                self.send_response(500)
+                self.send_header('Content-Type', 'application/json')
+                self.send_header('Access-Control-Allow-Origin', '*')
+                self.end_headers()
+                self.wfile.write(json.dumps({'error': str(e)}).encode())
+        elif self.path.startswith('/audiobook/stream/'):
+            # Stream audio file (inline, no attachment header) for in-browser playback
+            try:
+                parts = self.path.split('/audiobook/stream/')[1].split('/', 1)
+                info_hash = parts[0]
+                from urllib.parse import unquote as _unquote
+                filename = _unquote(parts[1]) if len(parts) > 1 else ''
+                if not re.match(r'^[a-f0-9]{40}$', info_hash) or not filename:
+                    raise ValueError('Invalid path')
+                if '..' in filename:
+                    raise ValueError('Invalid filename')
+                s3_key = f'{info_hash}/{filename}'
+                s3 = _get_s3_client()
+                if not s3:
+                    raise RuntimeError('S3 not available')
+                resp = s3.get_object(Bucket=S3_BUCKET, Key=s3_key)
+                file_size = resp['ContentLength']
+                ext = os.path.splitext(filename)[1].lower()
+                ct_map = {'.mp3': 'audio/mpeg', '.ogg': 'audio/ogg', '.m4a': 'audio/mp4', '.m4b': 'audio/mp4', '.flac': 'audio/flac', '.wav': 'audio/wav'}
+                content_type = ct_map.get(ext, 'audio/mpeg')
+                self.send_response(200)
+                self.send_header('Content-Type', content_type)
+                self.send_header('Content-Length', str(file_size))
+                self.send_header('Accept-Ranges', 'bytes')
+                self.send_header('Access-Control-Allow-Origin', '*')
+                self.send_header('Cache-Control', 'public, max-age=86400')
+                self.end_headers()
+                body = resp['Body']
+                while True:
+                    chunk = body.read(65536)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                body.close()
+            except Exception as e:
+                logger.warning('Audiobook stream error: %s', e)
+                try:
+                    self.send_response(404)
+                    self.send_header('Content-Type', 'text/plain')
+                    self.end_headers()
+                    self.wfile.write(f'Not found: {e}'.encode())
                 except Exception:
                     pass
         elif self.path == '/books':

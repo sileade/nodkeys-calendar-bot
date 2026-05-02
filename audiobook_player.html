@@ -1,0 +1,532 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Аудиокнига</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+:root {
+  --bg: #1a1c2e;
+  --bg2: #222540;
+  --bg3: #2a2d4a;
+  --text: #e0e0e0;
+  --text2: #94a3b8;
+  --accent: #4ade80;
+  --accent2: #22c55e;
+  --border: #2a2d42;
+  --danger: #ef4444;
+}
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  min-height: 100vh;
+  padding-bottom: 180px;
+}
+.header {
+  background: var(--bg2);
+  padding: 16px;
+  border-bottom: 1px solid var(--border);
+  position: sticky;
+  top: 0;
+  z-index: 10;
+}
+.header h1 {
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--accent);
+  margin-bottom: 4px;
+  line-height: 1.3;
+}
+.header .meta {
+  font-size: 12px;
+  color: var(--text2);
+}
+.header .meta span { margin-right: 12px; }
+
+.search-bar {
+  padding: 8px 16px;
+  background: var(--bg);
+  position: sticky;
+  top: 68px;
+  z-index: 9;
+}
+.search-bar input {
+  width: 100%;
+  padding: 8px 12px;
+  background: var(--bg3);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text);
+  font-size: 14px;
+  outline: none;
+}
+.search-bar input::placeholder { color: var(--text2); }
+.search-bar input:focus { border-color: var(--accent); }
+
+.group-header {
+  padding: 8px 16px 4px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--accent);
+  background: var(--bg);
+  position: sticky;
+  top: 112px;
+  z-index: 8;
+  border-bottom: 1px solid var(--border);
+}
+
+.track-list { list-style: none; }
+.track {
+  display: flex;
+  align-items: center;
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--border);
+  cursor: pointer;
+  transition: background 0.15s;
+  gap: 10px;
+}
+.track:hover, .track:active { background: var(--bg3); }
+.track.active { background: var(--bg3); }
+.track.active .track-name { color: var(--accent); }
+.track.playing .track-num::after {
+  content: '';
+  display: inline-block;
+  width: 12px;
+  height: 12px;
+  background: var(--accent);
+  border-radius: 50%;
+  animation: pulse 1s infinite;
+}
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.4; }
+}
+.track-num {
+  min-width: 32px;
+  font-size: 12px;
+  color: var(--text2);
+  text-align: center;
+}
+.track.playing .track-num { color: transparent; font-size: 0; min-width: 32px; display: flex; align-items: center; justify-content: center; }
+.track-info { flex: 1; min-width: 0; }
+.track-name {
+  font-size: 14px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.track-size {
+  font-size: 11px;
+  color: var(--text2);
+}
+.track-dl {
+  color: var(--text2);
+  text-decoration: none;
+  font-size: 18px;
+  padding: 4px;
+  flex-shrink: 0;
+}
+.track-dl:hover { color: var(--accent); }
+
+/* Player */
+.player {
+  position: fixed;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  background: var(--bg2);
+  border-top: 1px solid var(--border);
+  padding: 10px 16px 16px;
+  z-index: 100;
+  backdrop-filter: blur(10px);
+}
+.player-track {
+  font-size: 13px;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  margin-bottom: 6px;
+  text-align: center;
+}
+.player-progress {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+.player-time {
+  font-size: 11px;
+  color: var(--text2);
+  min-width: 38px;
+  text-align: center;
+}
+.progress-bar {
+  flex: 1;
+  height: 4px;
+  background: var(--bg3);
+  border-radius: 2px;
+  cursor: pointer;
+  position: relative;
+}
+.progress-fill {
+  height: 100%;
+  background: var(--accent);
+  border-radius: 2px;
+  width: 0%;
+  transition: width 0.3s linear;
+}
+.progress-bar:hover .progress-fill { height: 6px; margin-top: -1px; }
+
+.player-controls {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 20px;
+}
+.player-btn {
+  background: none;
+  border: none;
+  color: var(--text);
+  font-size: 22px;
+  cursor: pointer;
+  padding: 6px;
+  border-radius: 50%;
+  transition: all 0.15s;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 40px;
+  height: 40px;
+}
+.player-btn:hover { color: var(--accent); background: var(--bg3); }
+.player-btn.play {
+  font-size: 28px;
+  width: 52px;
+  height: 52px;
+  background: var(--accent);
+  color: var(--bg);
+}
+.player-btn.play:hover { background: var(--accent2); }
+.player-btn.small { font-size: 16px; width: 32px; height: 32px; }
+
+.speed-btn {
+  font-size: 11px;
+  font-weight: 700;
+  min-width: 36px;
+}
+
+.loading {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 60px 20px;
+  color: var(--text2);
+  font-size: 15px;
+}
+.loading::before {
+  content: '';
+  width: 24px;
+  height: 24px;
+  border: 3px solid var(--border);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+  margin-right: 12px;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+.empty {
+  text-align: center;
+  padding: 40px 20px;
+  color: var(--text2);
+}
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1 id="bookTitle">Загрузка...</h1>
+  <div class="meta">
+    <span id="metaFiles">📁 —</span>
+    <span id="metaSize">📦 —</span>
+  </div>
+</div>
+
+<div class="search-bar">
+  <input type="text" id="searchInput" placeholder="🔍 Поиск по файлам..." />
+</div>
+
+<div id="trackContainer">
+  <div class="loading">Загрузка аудиокниги...</div>
+</div>
+
+<div class="player" id="player" style="display:none;">
+  <div class="player-track" id="playerTrack">—</div>
+  <div class="player-progress">
+    <span class="player-time" id="timeCurrent">0:00</span>
+    <div class="progress-bar" id="progressBar">
+      <div class="progress-fill" id="progressFill"></div>
+    </div>
+    <span class="player-time" id="timeTotal">0:00</span>
+  </div>
+  <div class="player-controls">
+    <button class="player-btn small speed-btn" id="speedBtn" title="Скорость">1x</button>
+    <button class="player-btn" id="prevBtn" title="Предыдущий">⏮</button>
+    <button class="player-btn play" id="playBtn" title="Воспроизвести">▶</button>
+    <button class="player-btn" id="nextBtn" title="Следующий">⏭</button>
+    <button class="player-btn small" id="dlBtn" title="Скачать">⬇</button>
+  </div>
+</div>
+
+<audio id="audioEl" preload="auto"></audio>
+
+<script>
+const tg = window.Telegram && window.Telegram.WebApp;
+if (tg) {
+  tg.ready();
+  tg.expand();
+  tg.enableClosingConfirmation();
+}
+
+// Extract info_hash from URL params
+const params = new URLSearchParams(window.location.search);
+const infoHash = params.get('hash') || '';
+const baseUrl = window.location.origin;
+
+let tracks = [];
+let filteredTracks = [];
+let currentIdx = -1;
+let isPlaying = false;
+let playbackRate = 1;
+const speeds = [0.75, 1, 1.25, 1.5, 1.75, 2];
+let speedIdx = 1;
+
+const audio = document.getElementById('audioEl');
+const playerEl = document.getElementById('player');
+const playBtn = document.getElementById('playBtn');
+const prevBtn = document.getElementById('prevBtn');
+const nextBtn = document.getElementById('nextBtn');
+const speedBtn = document.getElementById('speedBtn');
+const dlBtn = document.getElementById('dlBtn');
+const progressBar = document.getElementById('progressBar');
+const progressFill = document.getElementById('progressFill');
+const timeCurrent = document.getElementById('timeCurrent');
+const timeTotal = document.getElementById('timeTotal');
+const playerTrack = document.getElementById('playerTrack');
+const searchInput = document.getElementById('searchInput');
+const trackContainer = document.getElementById('trackContainer');
+
+function formatTime(s) {
+  if (!s || !isFinite(s)) return '0:00';
+  const m = Math.floor(s / 60);
+  const sec = Math.floor(s % 60);
+  return m + ':' + (sec < 10 ? '0' : '') + sec;
+}
+
+function formatSize(bytes) {
+  if (bytes < 1024) return bytes + ' B';
+  if (bytes < 1048576) return (bytes / 1024).toFixed(1) + ' KB';
+  if (bytes < 1073741824) return (bytes / 1048576).toFixed(1) + ' MB';
+  return (bytes / 1073741824).toFixed(2) + ' GB';
+}
+
+function groupTracks(tracks) {
+  const groups = {};
+  tracks.forEach((t, i) => {
+    const name = t.filename.replace(/\.[^.]+$/, '');
+    const parts = name.split(/[_\-\s]+/);
+    let key;
+    if (parts.length >= 3 && /^\d+$/.test(parts[0]) && /^\d+$/.test(parts[1])) {
+      key = parts[0] + '_' + parts[1];
+    } else if (parts.length >= 2 && /^\d+$/.test(parts[0])) {
+      key = parts[0];
+    } else {
+      key = '__all__';
+    }
+    if (!groups[key]) groups[key] = [];
+    groups[key].push({ ...t, globalIdx: i });
+  });
+  return groups;
+}
+
+function groupLabel(key) {
+  const parts = key.split('_');
+  if (parts.length === 2 && /^\d+$/.test(parts[0]) && /^\d+$/.test(parts[1])) {
+    return 'Том ' + parseInt(parts[0]) + ', Часть ' + parseInt(parts[1]);
+  }
+  if (parts.length === 1 && /^\d+$/.test(parts[0])) {
+    return 'Часть ' + parseInt(parts[0]);
+  }
+  if (key === '__all__') return 'Все файлы';
+  return key;
+}
+
+function renderTracks(trackList) {
+  const groups = groupTracks(trackList);
+  const keys = Object.keys(groups).sort();
+  let html = '<ul class="track-list">';
+  
+  if (keys.length > 1 || (keys.length === 1 && keys[0] !== '__all__')) {
+    keys.forEach(key => {
+      const files = groups[key];
+      html += '<li class="group-header">' + groupLabel(key) + ' (' + files.length + ')</li>';
+      files.forEach((t, i) => {
+        const isActive = t.globalIdx === currentIdx;
+        const isPl = isActive && isPlaying;
+        html += '<li class="track' + (isActive ? ' active' : '') + (isPl ? ' playing' : '') + '" data-idx="' + t.globalIdx + '">';
+        html += '<span class="track-num">' + (i + 1) + '</span>';
+        html += '<div class="track-info"><div class="track-name">' + escHtml(t.filename.replace(/\.[^.]+$/, '')) + '</div>';
+        html += '<div class="track-size">' + formatSize(t.size) + '</div></div>';
+        html += '<a class="track-dl" href="' + baseUrl + '/audiobook/file/' + infoHash + '/' + encodeURIComponent(t.filename) + '" title="Скачать">⬇</a>';
+        html += '</li>';
+      });
+    });
+  } else {
+    trackList.forEach((t, i) => {
+      const isActive = i === currentIdx;
+      const isPl = isActive && isPlaying;
+      html += '<li class="track' + (isActive ? ' active' : '') + (isPl ? ' playing' : '') + '" data-idx="' + i + '">';
+      html += '<span class="track-num">' + (i + 1) + '</span>';
+      html += '<div class="track-info"><div class="track-name">' + escHtml(t.filename.replace(/\.[^.]+$/, '')) + '</div>';
+      html += '<div class="track-size">' + formatSize(t.size) + '</div></div>';
+      html += '<a class="track-dl" href="' + baseUrl + '/audiobook/file/' + infoHash + '/' + encodeURIComponent(t.filename) + '" title="Скачать">⬇</a>';
+      html += '</li>';
+    });
+  }
+  html += '</ul>';
+  trackContainer.innerHTML = html;
+
+  // Attach click handlers
+  trackContainer.querySelectorAll('.track').forEach(el => {
+    el.addEventListener('click', (e) => {
+      if (e.target.closest('.track-dl')) return;
+      const idx = parseInt(el.dataset.idx);
+      playTrack(idx);
+    });
+  });
+}
+
+function escHtml(s) {
+  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+function playTrack(idx) {
+  if (idx < 0 || idx >= tracks.length) return;
+  currentIdx = idx;
+  const t = tracks[idx];
+  const streamUrl = baseUrl + '/audiobook/stream/' + infoHash + '/' + encodeURIComponent(t.filename);
+  audio.src = streamUrl;
+  audio.playbackRate = speeds[speedIdx];
+  audio.play().then(() => {
+    isPlaying = true;
+    playBtn.textContent = '⏸';
+    playerEl.style.display = '';
+    playerTrack.textContent = t.filename.replace(/\.[^.]+$/, '');
+    renderTracks(filteredTracks.length ? filteredTracks : tracks);
+    // Scroll to active
+    const activeEl = trackContainer.querySelector('.track.active');
+    if (activeEl) activeEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  }).catch(() => {
+    isPlaying = false;
+  });
+}
+
+function togglePlay() {
+  if (!audio.src) return;
+  if (isPlaying) {
+    audio.pause();
+    isPlaying = false;
+    playBtn.textContent = '▶';
+  } else {
+    audio.play();
+    isPlaying = true;
+    playBtn.textContent = '⏸';
+  }
+  renderTracks(filteredTracks.length ? filteredTracks : tracks);
+}
+
+playBtn.addEventListener('click', togglePlay);
+prevBtn.addEventListener('click', () => playTrack(currentIdx - 1));
+nextBtn.addEventListener('click', () => playTrack(currentIdx + 1));
+
+speedBtn.addEventListener('click', () => {
+  speedIdx = (speedIdx + 1) % speeds.length;
+  audio.playbackRate = speeds[speedIdx];
+  speedBtn.textContent = speeds[speedIdx] + 'x';
+});
+
+dlBtn.addEventListener('click', () => {
+  if (currentIdx >= 0 && currentIdx < tracks.length) {
+    const t = tracks[currentIdx];
+    window.open(baseUrl + '/audiobook/file/' + infoHash + '/' + encodeURIComponent(t.filename), '_blank');
+  }
+});
+
+// Progress bar
+audio.addEventListener('timeupdate', () => {
+  if (audio.duration) {
+    const pct = (audio.currentTime / audio.duration) * 100;
+    progressFill.style.width = pct + '%';
+    timeCurrent.textContent = formatTime(audio.currentTime);
+    timeTotal.textContent = formatTime(audio.duration);
+  }
+});
+
+audio.addEventListener('ended', () => {
+  // Auto-play next
+  if (currentIdx < tracks.length - 1) {
+    playTrack(currentIdx + 1);
+  } else {
+    isPlaying = false;
+    playBtn.textContent = '▶';
+    renderTracks(filteredTracks.length ? filteredTracks : tracks);
+  }
+});
+
+progressBar.addEventListener('click', (e) => {
+  if (audio.duration) {
+    const rect = progressBar.getBoundingClientRect();
+    const pct = (e.clientX - rect.left) / rect.width;
+    audio.currentTime = pct * audio.duration;
+  }
+});
+
+// Search
+searchInput.addEventListener('input', () => {
+  const q = searchInput.value.toLowerCase().trim();
+  if (!q) {
+    filteredTracks = [];
+    renderTracks(tracks);
+    return;
+  }
+  filteredTracks = tracks.filter(t => t.filename.toLowerCase().includes(q));
+  renderTracks(filteredTracks);
+});
+
+// Load data
+async function loadData() {
+  try {
+    const resp = await fetch(baseUrl + '/audiobook/api/' + infoHash);
+    if (!resp.ok) throw new Error('Not found');
+    const data = await resp.json();
+    
+    document.getElementById('bookTitle').textContent = data.title || 'Аудиокнига';
+    document.getElementById('metaFiles').textContent = '📁 ' + data.files.length + ' файлов';
+    document.getElementById('metaSize').textContent = '📦 ' + formatSize(data.total_size || 0);
+    
+    tracks = data.files.sort((a, b) => a.filename.localeCompare(b.filename));
+    renderTracks(tracks);
+    playerEl.style.display = '';
+  } catch (e) {
+    trackContainer.innerHTML = '<div class="empty">❌ Аудиокнига не найдена<br><br><small>' + escHtml(e.message) + '</small></div>';
+  }
+}
+
+loadData();
+</script>
+</body>
+</html>
