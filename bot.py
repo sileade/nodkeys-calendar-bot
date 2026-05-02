@@ -792,13 +792,17 @@ def _ensure_rutracker_login() -> _flib_httpx.Client:
     global _rt_client, _rt_logged_in
 
     if _rt_client is None:
-        _rt_client = _flib_httpx.Client(
-            headers={
+        _rt_kwargs = {
+            "headers": {
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             },
-            follow_redirects=True,
-            timeout=20,
-        )
+            "follow_redirects": True,
+            "timeout": 20,
+        }
+        if FLIBUSTA_PROXY_URL:
+            _rt_kwargs["proxy"] = FLIBUSTA_PROXY_URL
+            logger.info("RuTracker using proxy: %s", FLIBUSTA_PROXY_URL)
+        _rt_client = _flib_httpx.Client(**_rt_kwargs)
 
     if not _rt_logged_in:
         try:
