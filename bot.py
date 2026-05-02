@@ -15,7 +15,7 @@ Telegram bot that analyzes messages using Claude AI and routes them:
 - All through natural language — no commands needed
 """
 
-VERSION = "9.2"
+VERSION = "9.3"
 
 import os
 import re
@@ -1247,7 +1247,7 @@ async def audiobook_download_pipeline(
             f"📁 {len(cached_files)} аудиофайлов\n\n"
             f"📤 Отправляю..."
         )
-        await _send_audio_files_from_s3(bot, chat_id, cached_files, title)
+        await _send_audio_files_from_s3(bot, chat_id, cached_files, title, info_hash=info_hash)
         return
 
     # ── Step 2: Add to qBittorrent ──
@@ -1388,7 +1388,7 @@ async def audiobook_download_pipeline(
         f"📁 {len(uploaded)} файлов ({_format_size(sum(f['size'] for f in uploaded))})\n\n"
         f"📤 Отправляю аудиофайлы..."
     )
-    await _send_audio_files_from_s3(bot, chat_id, uploaded, title)
+    await _send_audio_files_from_s3(bot, chat_id, uploaded, title, info_hash=info_hash)
 
     # Clean up torrent (optional: pause seeding)
     try:
@@ -1402,90 +1402,183 @@ async def audiobook_download_pipeline(
         pass
 
 
+def _group_audio_files(filenames: list[str]) -> list[tuple[str, list[str]]]:
+    """Group audio files by chapter/part prefix.
+    
+    Examples:
+        01_01_01.mp3, 01_01_02.mp3 → group '01_01' (part 1, chapter 1)
+        Chapter_01.mp3, Chapter_02.mp3 → each is its own group
+    Returns list of (group_label, [filenames]).
+    """
+    if not filenames:
+        return []
+    
+    sorted_files = sorted(filenames)
+    
+    # Try to detect grouping pattern
+    # Pattern: XX_YY_ZZ.mp3 → group by XX_YY
+    groups = {}
+    for fname in sorted_files:
+        name = os.path.splitext(fname)[0]
+        parts = re.split(r'[_\-\s]+', name)
+        if len(parts) >= 3 and all(p.isdigit() for p in parts[:2]):
+            # Pattern like 01_01_01 → group by first two parts
+            group_key = f"{parts[0]}_{parts[1]}"
+        elif len(parts) >= 2 and parts[0].isdigit():
+            # Pattern like 01_something → group by first part
+            group_key = parts[0]
+        else:
+            # No clear pattern → each file is its own group
+            group_key = name
+        
+        if group_key not in groups:
+            groups[group_key] = []
+        groups[group_key].append(fname)
+    
+    # Convert to sorted list of tuples
+    result = []
+    for key in sorted(groups.keys()):
+        files = sorted(groups[key])
+        # Generate human-readable label
+        parts = key.split('_')
+        if len(parts) == 2 and all(p.isdigit() for p in parts):
+            label = f"Том {int(parts[0])}, Часть {int(parts[1])}"
+        elif len(parts) == 1 and parts[0].isdigit():
+            label = f"Часть {int(parts[0])}"
+        else:
+            label = key
+        result.append((label, files))
+    
+    return result
+
+
 async def _send_audio_files_from_s3(
-    bot, chat_id: int, files: list[dict], title: str
+    bot, chat_id: int, files: list[dict], title: str, info_hash: str = ""
 ):
-    """Download files from S3 and send to Telegram as audio."""
+    """Download files from S3 and send to Telegram as audio, grouped by chapters."""
     tmp_dir = f"/tmp/audiobook_{uuid.uuid4().hex[:8]}"
     os.makedirs(tmp_dir, exist_ok=True)
 
     sent_count = 0
     total = len(files)
-
-    # Sort files by filename for correct order
     files_sorted = sorted(files, key=lambda x: x['filename'])
+    files_by_name = {f['filename']: f for f in files_sorted}
 
-    for i, f in enumerate(files_sorted):
-        local_path = os.path.join(tmp_dir, f['filename'])
-        ok = await asyncio.to_thread(_download_from_s3, f['key'], local_path)
-        if not ok:
-            continue
+    # Send S3 download link first
+    if info_hash:
+        download_url = f"https://bot.nodkeys.com/audiobook/download/{info_hash}"
+        try:
+            await bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    f"\U0001f517 <b>Ссылка для скачивания:</b>\n"
+                    f"<a href=\"{download_url}\">{title[:60]}</a>\n\n"
+                    f"\U0001f4c1 {total} файлов | \U0001f4e6 {_format_size(sum(f['size'] for f in files_sorted))}\n\n"
+                    f"\U0001f4e4 Отправляю аудиофайлы в чат..."
+                ),
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+            )
+        except Exception as e:
+            logger.error("Send download link error: %s", e)
 
-        file_size = os.path.getsize(local_path)
-        if file_size > TELEGRAM_MAX_AUDIO_SIZE:
-            # Send as document for large files
+    # Group files
+    filenames = [f['filename'] for f in files_sorted]
+    groups = _group_audio_files(filenames)
+    
+    global_idx = 0
+    for group_label, group_files in groups:
+        # Send group header if more than 1 group
+        if len(groups) > 1:
             try:
-                with open(local_path, 'rb') as audio_file:
-                    await bot.send_document(
-                        chat_id=chat_id,
-                        document=audio_file,
-                        filename=f['filename'],
-                        caption=f"🎧 {title[:40]} — {f['filename']}\n📦 {_format_size(file_size)}",
-                    )
-                sent_count += 1
-            except Exception as e:
-                logger.error("Telegram send document error: %s", e)
-        else:
-            # Send as audio
-            try:
-                # Extract track info from filename
-                track_title = os.path.splitext(f['filename'])[0]
-                with open(local_path, 'rb') as audio_file:
-                    await bot.send_audio(
-                        chat_id=chat_id,
-                        audio=audio_file,
-                        title=track_title,
-                        performer=title[:40],
-                        caption=f"📖 {i+1}/{total}",
-                    )
-                sent_count += 1
-            except Exception as e:
-                logger.error("Telegram send audio error: %s", e)
-                # Fallback: try as document
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=f"\U0001f4d6 <b>{group_label}</b> ({len(group_files)} файлов)",
+                    parse_mode="HTML",
+                )
+            except Exception:
+                pass
+            await asyncio.sleep(0.5)
+
+        for fname in group_files:
+            global_idx += 1
+            f = files_by_name.get(fname)
+            if not f:
+                continue
+            
+            local_path = os.path.join(tmp_dir, fname)
+            ok = await asyncio.to_thread(_download_from_s3, f['key'], local_path)
+            if not ok:
+                continue
+
+            file_size = os.path.getsize(local_path)
+            if file_size > TELEGRAM_MAX_AUDIO_SIZE:
                 try:
                     with open(local_path, 'rb') as audio_file:
                         await bot.send_document(
                             chat_id=chat_id,
                             document=audio_file,
-                            filename=f['filename'],
+                            filename=fname,
+                            caption=f"\U0001f3a7 {title[:40]} \u2014 {fname}",
                         )
                     sent_count += 1
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.error("Telegram send document error: %s", e)
+            else:
+                try:
+                    track_title = os.path.splitext(fname)[0]
+                    with open(local_path, 'rb') as audio_file:
+                        await bot.send_audio(
+                            chat_id=chat_id,
+                            audio=audio_file,
+                            title=track_title,
+                            performer=title[:40],
+                            caption=f"\U0001f4d6 {global_idx}/{total}",
+                        )
+                    sent_count += 1
+                except Exception as e:
+                    logger.error("Telegram send audio error: %s", e)
+                    try:
+                        with open(local_path, 'rb') as audio_file:
+                            await bot.send_document(
+                                chat_id=chat_id,
+                                document=audio_file,
+                                filename=fname,
+                            )
+                        sent_count += 1
+                    except Exception:
+                        pass
 
-        # Clean up temp file after sending
-        try:
-            os.remove(local_path)
-        except Exception:
-            pass
+            # Clean up temp file after sending
+            try:
+                os.remove(local_path)
+            except Exception:
+                pass
+            
+            # Small delay to avoid Telegram rate limiting
+            await asyncio.sleep(1)
 
     # Clean up temp dir
     try:
-        os.rmdir(tmp_dir)
+        import shutil
+        shutil.rmtree(tmp_dir, ignore_errors=True)
     except Exception:
         pass
 
     if sent_count > 0:
+        download_url = f"https://bot.nodkeys.com/audiobook/download/{info_hash}" if info_hash else ""
+        dl_text = f"\n\U0001f517 <a href=\"{download_url}\">Скачать все файлы</a>" if download_url else ""
         try:
             await bot.send_message(
                 chat_id=chat_id,
                 text=(
-                    f"✅ <b>Аудиокнига отправлена!</b>\n\n"
-                    f"🎧 {title[:60]}\n"
-                    f"📁 {sent_count}/{total} файлов\n\n"
-                    f"💡 При повторном запросе файлы будут отправлены мгновенно из кэша."
+                    f"\u2705 <b>Аудиокнига отправлена!</b>\n\n"
+                    f"\U0001f3a7 {title[:60]}\n"
+                    f"\U0001f4c1 {sent_count}/{total} файлов{dl_text}\n\n"
+                    f"\U0001f4a1 При повторном запросе файлы будут отправлены мгновенно из кэша."
                 ),
                 parse_mode="HTML",
+                disable_web_page_preview=True,
             )
         except Exception:
             pass
@@ -1493,7 +1586,7 @@ async def _send_audio_files_from_s3(
         try:
             await bot.send_message(
                 chat_id=chat_id,
-                text=f"❌ Не удалось отправить аудиофайлы для: {title[:60]}",
+                text=f"\u274c Не удалось отправить аудиофайлы для: {title[:60]}",
             )
         except Exception:
             pass
@@ -1502,7 +1595,7 @@ async def _send_audio_files_from_s3(
 async def _send_audio_files_from_disk(
     bot, chat_id: int, local_dir: str, title: str
 ):
-    """Send audio files directly from local disk to Telegram."""
+    """Send audio files directly from local disk to Telegram, grouped by chapters."""
     sent_count = 0
     audio_files = []
 
@@ -1510,44 +1603,66 @@ async def _send_audio_files_from_disk(
         for fname in sorted(files):
             ext = os.path.splitext(fname)[1].lower()
             if ext in AUDIO_EXTENSIONS:
-                audio_files.append(os.path.join(root, fname))
+                audio_files.append((fname, os.path.join(root, fname)))
 
     total = len(audio_files)
-    for i, fpath in enumerate(audio_files):
-        file_size = os.path.getsize(fpath)
-        fname = os.path.basename(fpath)
+    filenames = [f[0] for f in audio_files]
+    file_paths = {f[0]: f[1] for f in audio_files}
+    groups = _group_audio_files(filenames)
+    
+    global_idx = 0
+    for group_label, group_files in groups:
+        if len(groups) > 1:
+            try:
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=f"\U0001f4d6 <b>{group_label}</b> ({len(group_files)} файлов)",
+                    parse_mode="HTML",
+                )
+            except Exception:
+                pass
+            await asyncio.sleep(0.5)
 
-        if file_size > TELEGRAM_MAX_AUDIO_SIZE:
-            try:
-                with open(fpath, 'rb') as f:
-                    await bot.send_document(
-                        chat_id=chat_id,
-                        document=f,
-                        filename=fname,
-                        caption=f"🎧 {title[:40]} — {fname}",
-                    )
-                sent_count += 1
-            except Exception as e:
-                logger.error("Send from disk error: %s", e)
-        else:
-            try:
-                track_title = os.path.splitext(fname)[0]
-                with open(fpath, 'rb') as f:
-                    await bot.send_audio(
-                        chat_id=chat_id,
-                        audio=f,
-                        title=track_title,
-                        performer=title[:40],
-                        caption=f"📖 {i+1}/{total}",
-                    )
-                sent_count += 1
-            except Exception as e:
-                logger.error("Send audio from disk error: %s", e)
+        for fname in group_files:
+            global_idx += 1
+            fpath = file_paths.get(fname)
+            if not fpath:
+                continue
+            file_size = os.path.getsize(fpath)
+
+            if file_size > TELEGRAM_MAX_AUDIO_SIZE:
+                try:
+                    with open(fpath, 'rb') as f:
+                        await bot.send_document(
+                            chat_id=chat_id,
+                            document=f,
+                            filename=fname,
+                            caption=f"\U0001f3a7 {title[:40]} \u2014 {fname}",
+                        )
+                    sent_count += 1
+                except Exception as e:
+                    logger.error("Send from disk error: %s", e)
+            else:
+                try:
+                    track_title = os.path.splitext(fname)[0]
+                    with open(fpath, 'rb') as f:
+                        await bot.send_audio(
+                            chat_id=chat_id,
+                            audio=f,
+                            title=track_title,
+                            performer=title[:40],
+                            caption=f"\U0001f4d6 {global_idx}/{total}",
+                        )
+                    sent_count += 1
+                except Exception as e:
+                    logger.error("Send audio from disk error: %s", e)
+            
+            await asyncio.sleep(1)
 
     if sent_count > 0:
         await bot.send_message(
             chat_id=chat_id,
-            text=f"✅ <b>Отправлено {sent_count}/{total} аудиофайлов</b>\n🎧 {title[:60]}",
+            text=f"\u2705 <b>Отправлено {sent_count}/{total} аудиофайлов</b>\n\U0001f3a7 {title[:60]}",
             parse_mode="HTML",
         )
 
@@ -7827,6 +7942,95 @@ h3 { margin: 4px 8px 8px; color: #4ade80; font-size: 14px; border-bottom: 1px so
                 self.send_header('Content-Type', 'text/html; charset=utf-8')
                 self.end_headers()
                 self.wfile.write(f'<html><body style="background:#1a1c2e;color:#e0e0e0;font-family:sans-serif;padding:20px">Error: {e}</body></html>'.encode())
+        elif self.path.startswith('/audiobook/download/'):
+            # Audiobook download page — list files from S3 for a given info_hash
+            try:
+                info_hash = self.path.split('/audiobook/download/')[1].split('/')[0].split('?')[0].strip()
+                if not re.match(r'^[a-f0-9]{40}$', info_hash):
+                    raise ValueError('Invalid info_hash')
+                cache = _load_audiobook_cache()
+                entry = cache.get(info_hash)
+                if not entry:
+                    self.send_response(404)
+                    self.send_header('Content-Type', 'text/html; charset=utf-8')
+                    self.end_headers()
+                    self.wfile.write(b'<html><body style="background:#1a1c2e;color:#e0e0e0;font-family:sans-serif;padding:20px"><h2>Audiobook not found in cache</h2></body></html>')
+                    return
+                title = entry.get('title', 'Audiobook')
+                files = sorted(entry.get('files', []))
+                total_size = entry.get('total_size', 0)
+                html = f'''<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>{title}</title>
+<style>
+body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #1a1c2e; color: #e0e0e0; margin: 0; padding: 16px; font-size: 14px; }}
+h2 {{ color: #4ade80; margin-bottom: 4px; }}
+.info {{ color: #94a3b8; margin-bottom: 16px; font-size: 13px; }}
+.file {{ display: flex; padding: 6px 10px; border-bottom: 1px solid #2a2d42; align-items: center; }}
+.file:hover {{ background: #2a2d42; }}
+.num {{ color: #64748b; min-width: 35px; font-size: 12px; }}
+.name {{ flex: 1; color: #e0e0e0; text-decoration: none; }}
+.name:hover {{ color: #4ade80; }}
+a.dl {{ color: #4ade80; text-decoration: none; padding: 3px 10px; border: 1px solid #4ade80; border-radius: 6px; font-size: 12px; margin-left: 8px; }}
+a.dl:hover {{ background: #4ade80; color: #1a1c2e; }}
+</style></head><body>
+<h2>\U0001f3a7 {title}</h2>
+<div class="info">\U0001f4c1 {len(files)} files | \U0001f4e6 {_format_size(total_size)}</div>\n'''
+                for i, fname in enumerate(files, 1):
+                    dl_url = f'/audiobook/file/{info_hash}/{quote(fname)}'
+                    html += f'<div class="file"><span class="num">{i}.</span><a class="name" href="{dl_url}">{fname}</a><a class="dl" href="{dl_url}">\u2b07 Download</a></div>\n'
+                html += '</body></html>'
+                self.send_response(200)
+                self.send_header('Content-Type', 'text/html; charset=utf-8')
+                self.send_header('Access-Control-Allow-Origin', '*')
+                self.end_headers()
+                self.wfile.write(html.encode())
+            except Exception as e:
+                self.send_response(500)
+                self.send_header('Content-Type', 'text/html; charset=utf-8')
+                self.end_headers()
+                self.wfile.write(f'<html><body style="background:#1a1c2e;color:#e0e0e0;font-family:sans-serif;padding:20px">Error: {e}</body></html>'.encode())
+        elif self.path.startswith('/audiobook/file/'):
+            # Serve individual audiobook file from S3
+            try:
+                parts = self.path.split('/audiobook/file/')[1].split('/', 1)
+                info_hash = parts[0]
+                from urllib.parse import unquote as _unquote
+                filename = _unquote(parts[1]) if len(parts) > 1 else ''
+                if not re.match(r'^[a-f0-9]{40}$', info_hash) or not filename:
+                    raise ValueError('Invalid path')
+                # Prevent path traversal
+                if '..' in filename:
+                    raise ValueError('Invalid filename')
+                s3_key = f'{info_hash}/{filename}'
+                s3 = _get_s3_client()
+                if not s3:
+                    raise RuntimeError('S3 not available')
+                # Stream from S3
+                resp = s3.get_object(Bucket=S3_BUCKET, Key=s3_key)
+                file_size = resp['ContentLength']
+                self.send_response(200)
+                content_type = 'audio/mpeg' if filename.lower().endswith('.mp3') else 'application/octet-stream'
+                self.send_header('Content-Type', content_type)
+                self.send_header('Content-Disposition', f'attachment; filename="{filename}"')
+                self.send_header('Content-Length', str(file_size))
+                self.send_header('Access-Control-Allow-Origin', '*')
+                self.end_headers()
+                body = resp['Body']
+                while True:
+                    chunk = body.read(65536)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                body.close()
+            except Exception as e:
+                logger.warning('Audiobook file serve error: %s', e)
+                try:
+                    self.send_response(404)
+                    self.send_header('Content-Type', 'text/html; charset=utf-8')
+                    self.end_headers()
+                    self.wfile.write(f'<html><body style="background:#1a1c2e;color:#e0e0e0;font-family:sans-serif;padding:20px">File not found: {e}</body></html>'.encode())
+                except Exception:
+                    pass
         elif self.path == '/books':
             try:
                 from kindle_handler import get_books_history
