@@ -1,7 +1,7 @@
-.env
 __pycache__/
 *.pyc
-*.pyo
-.DS_Store
-/tmp/
-*.log
+*.bak*
+data/
+*.py.v4*
+patch_*.py
+fix_*.py
