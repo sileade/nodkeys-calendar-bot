@@ -5025,57 +5025,63 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Check if Claude decided to skip
-    if data.get("action") == "skip":
-        reasoning = data.get("reasoning", "Сообщение слишком абстрактное")
-        await thinking_msg.edit_text(
-            f"🤔 <b>Не создаю запись</b>\n\n"
-            f"💭 <i>{reasoning}</i>\n\n"
-            f"💡 Попробуйте уточнить: что именно нужно сделать, когда и где.",
-            parse_mode="HTML"
-        )
-        return
-    
-    # Check confidence threshold
-    confidence_val = data.get("confidence", 0)
-    if confidence_val < 0.4:
-        reasoning = data.get("reasoning", "Недостаточно информации")
-        await thinking_msg.edit_text(
-            f"⚠️ <b>Низкая уверенность ({confidence_val:.0%})</b>\n\n"
-            f"💭 <i>{reasoning}</i>\n\n"
-            f"💡 Уточните сообщение: добавьте дату, время или конкретное действие.",
-            parse_mode="HTML"
-        )
-        return
-    
-    # Streaming-like: show what was understood
-    type_labels = {
-        "event": "📅 Событие", "task": "✅ Задача", "reminder": "🔔 Напоминание",
-        "note": "📝 Заметка", "diary": "📖 Дневник", "edit_event": "✏️ Редактирование",
-    }
-    if entry_type in type_labels:
-        progress_text = f"{type_labels[entry_type]}: <b>{data.get('title', '...')}</b>"
-        if data.get("date"):
-            progress_text += f"\n📅 {data['date']}"
-            # Check day overload for events
-            if entry_type in ("event", "task"):
-                try:
-                    overload = await asyncio.to_thread(_check_day_overload, data["date"])
-                    if overload.get("is_overloaded"):
-                        progress_text += f"\n⚠️ <i>День загружен: {overload['event_count']} событий ({overload['total_hours']}ч)</i>"
-                except Exception:
-                    pass
-        if data.get("time_start"):
-            progress_text += f" в {data['time_start']}"
-        try:
-            await thinking_msg.edit_text(f"⏳ {progress_text}\n\n<i>Создаю...</i>", parse_mode="HTML")
-        except Exception:
-            pass
-
-    original_text = update.message.text or ''
-    # ═══ Tool Calling Dispatch ═══
+    # ═══ Determine response format ═══
+    # New format: tool_name/tool_input (Tool Calling from Claude)
+    # Old format: action/confidence/type (legacy, should not happen anymore)
     tool_name = data.get("tool_name", "")
     tool_input = data.get("tool_input", {})
+    
+    if tool_name:
+        # New Tool Calling format — skip legacy confidence/action checks
+        logger.info("Tool Calling format detected: tool=%s", tool_name)
+    else:
+        # Legacy format — check action=skip and confidence threshold
+        if data.get("action") == "skip":
+            reasoning = data.get("reasoning", "Сообщение слишком абстрактное")
+            await thinking_msg.edit_text(
+                f"🤔 <b>Не создаю запись</b>\n\n"
+                f"💭 <i>{reasoning}</i>\n\n"
+                f"💡 Попробуйте уточнить: что именно нужно сделать, когда и где.",
+                parse_mode="HTML"
+            )
+            return
+        
+        confidence_val = data.get("confidence", 0)
+        if confidence_val < 0.4:
+            reasoning = data.get("reasoning", "Недостаточно информации")
+            await thinking_msg.edit_text(
+                f"⚠️ <b>Низкая уверенность ({confidence_val:.0%})</b>\n\n"
+                f"💭 <i>{reasoning}</i>\n\n"
+                f"💡 Уточните сообщение: добавьте дату, время или конкретное действие.",
+                parse_mode="HTML"
+            )
+            return
+        
+        # Streaming-like: show what was understood (legacy format has entry_type)
+        entry_type = data.get("type", "")
+        type_labels = {
+            "event": "📅 Событие", "task": "✅ Задача", "reminder": "🔔 Напоминание",
+            "note": "📝 Заметка", "diary": "📖 Дневник", "edit_event": "✏️ Редактирование",
+        }
+        if entry_type in type_labels:
+            progress_text = f"{type_labels[entry_type]}: <b>{data.get('title', '...')}</b>"
+            if data.get("date"):
+                progress_text += f"\n📅 {data['date']}"
+                if entry_type in ("event", "task"):
+                    try:
+                        overload = await asyncio.to_thread(_check_day_overload, data["date"])
+                        if overload.get("is_overloaded"):
+                            progress_text += f"\n⚠️ <i>День загружен: {overload['event_count']} событий ({overload['total_hours']}ч)</i>"
+                    except Exception:
+                        pass
+            if data.get("time_start"):
+                progress_text += f" в {data['time_start']}"
+            try:
+                await thinking_msg.edit_text(f"⏳ {progress_text}\n\n<i>Создаю...</i>", parse_mode="HTML")
+            except Exception:
+                pass
+
+    original_text = update.message.text or ''
     
     logger.info("Dispatching tool: %s", tool_name)
     
