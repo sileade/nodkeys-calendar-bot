@@ -1055,7 +1055,7 @@ def _check_s3_cache(info_hash: str) -> list[dict] | None:
 
 
 def _qbt_add_magnet(magnet: str, info_hash: str) -> bool:
-    """Add magnet link to qBittorrent with specific save path."""
+    """Add magnet link to qBittorrent with specific save path and force start."""
     try:
         import httpx
         save_path = f"{AUDIOBOOK_DOWNLOAD_DIR}/{info_hash}"
@@ -1070,7 +1070,20 @@ def _qbt_add_magnet(magnet: str, info_hash: str) -> bool:
         )
         if resp.status_code == 200 and resp.text.strip() in ('Ok.', 'Fails.'):
             logger.info("qBittorrent add torrent: %s → %s", info_hash[:8], resp.text.strip())
-            return resp.text.strip() == 'Ok.'
+            if resp.text.strip() == 'Ok.':
+                # Force start to avoid stuck in 'error' state
+                _time.sleep(2)  # Wait for torrent to be registered
+                try:
+                    httpx.post(
+                        f"{QBITTORRENT_URL}/api/v2/torrents/setForceStart",
+                        data={'hashes': info_hash, 'value': 'true'},
+                        timeout=5,
+                    )
+                    logger.info("qBittorrent force start: %s", info_hash[:8])
+                except Exception as e2:
+                    logger.warning("qBittorrent force start failed: %s", e2)
+                return True
+            return False
         logger.warning("qBittorrent add unexpected: HTTP %d %s", resp.status_code, resp.text[:100])
         return False
     except Exception as e:
