@@ -7,6 +7,7 @@ Telegram bot that analyzes messages using Claude AI and routes them:
 - Diary entries → Apple Notes diary with chronography (one note per day)
 - Book search → Flibusta OPDS + Anna's Archive + Jackett + AI Rethink
 - Audiobook search → RuTracker (auth + scraping + magnet links)
+- Audiobook download → qBittorrent + SeaweedFS S3 cache + Telegram audio delivery
 - Kindle: AI format detection, Calibre conversion, SMTP delivery
 - X-Ray: AI-powered book analysis (characters, themes, timeline)
 - Kindle Clippings: parse My Clippings.txt → key takeaways
@@ -14,7 +15,7 @@ Telegram bot that analyzes messages using Claude AI and routes them:
 - All through natural language — no commands needed
 """
 
-VERSION = "9.1"
+VERSION = "9.2"
 
 import os
 import re
@@ -944,6 +945,598 @@ def get_audiobook_magnet(topic_id: str) -> str | None:
     except Exception as e:
         logger.error("RuTracker magnet error: %s", e)
         return None
+
+
+# ══════════════════════════════════════════════════════════
+# ██  AUDIOBOOK DOWNLOAD PIPELINE: qBittorrent → S3 → Telegram
+# ══════════════════════════════════════════════════════════
+
+QBITTORRENT_URL = os.environ.get("QBITTORRENT_URL", "http://qbittorrent:8080")
+S3_ENDPOINT = os.environ.get("S3_ENDPOINT", "http://10.250.1.201:8333")
+S3_ACCESS_KEY = os.environ.get("S3_ACCESS_KEY", "media")
+S3_SECRET_KEY = os.environ.get("S3_SECRET_KEY", "")
+S3_BUCKET = os.environ.get("S3_BUCKET", "audiobooks")
+AUDIOBOOK_DOWNLOAD_DIR = "/downloads/audiobooks"
+AUDIOBOOK_CACHE_FILE = "/app/data/audiobook_cache.json"
+AUDIO_EXTENSIONS = {".mp3", ".m4a", ".m4b", ".ogg", ".opus", ".flac", ".wav", ".aac", ".wma"}
+TELEGRAM_MAX_AUDIO_SIZE = 49 * 1024 * 1024  # 49MB (Telegram limit ~50MB)
+
+# S3 client (lazy init)
+_s3_client = None
+
+def _get_s3_client():
+    """Get or create boto3 S3 client."""
+    global _s3_client
+    if _s3_client is None:
+        try:
+            import boto3
+            from botocore.config import Config
+            _s3_client = boto3.client(
+                's3',
+                endpoint_url=S3_ENDPOINT,
+                aws_access_key_id=S3_ACCESS_KEY,
+                aws_secret_access_key=S3_SECRET_KEY,
+                region_name='us-east-1',
+                config=Config(signature_version='s3v4'),
+            )
+        except Exception as e:
+            logger.error("S3 client init error: %s", e)
+    return _s3_client
+
+
+def _load_audiobook_cache() -> dict:
+    """Load audiobook cache: {info_hash: {title, s3_prefix, files, timestamp}}."""
+    try:
+        if os.path.exists(AUDIOBOOK_CACHE_FILE):
+            with open(AUDIOBOOK_CACHE_FILE, 'r', encoding='utf-8') as f:
+                return json.load(f)
+    except Exception as e:
+        logger.error("Audiobook cache load error: %s", e)
+    return {}
+
+
+def _save_audiobook_cache(cache: dict):
+    """Save audiobook cache to disk."""
+    try:
+        os.makedirs(os.path.dirname(AUDIOBOOK_CACHE_FILE), exist_ok=True)
+        with open(AUDIOBOOK_CACHE_FILE, 'w', encoding='utf-8') as f:
+            json.dump(cache, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.error("Audiobook cache save error: %s", e)
+
+
+def _extract_info_hash(magnet: str) -> str | None:
+    """Extract info_hash from magnet link."""
+    m = re.search(r'btih:([a-fA-F0-9]{40})', magnet)
+    if m:
+        return m.group(1).lower()
+    # Base32 encoded hash
+    m = re.search(r'btih:([A-Za-z2-7]{32})', magnet)
+    if m:
+        import base64
+        try:
+            decoded = base64.b32decode(m.group(1).upper())
+            return decoded.hex().lower()
+        except Exception:
+            pass
+    return None
+
+
+def _check_s3_cache(info_hash: str) -> list[dict] | None:
+    """Check if audiobook files exist in S3 cache.
+    Returns list of {key, size, filename} or None."""
+    s3 = _get_s3_client()
+    if not s3:
+        return None
+    try:
+        prefix = f"{info_hash}/"
+        resp = s3.list_objects_v2(Bucket=S3_BUCKET, Prefix=prefix)
+        contents = resp.get('Contents', [])
+        if not contents:
+            return None
+        files = []
+        for obj in contents:
+            key = obj['Key']
+            fname = key.split('/')[-1]
+            ext = os.path.splitext(fname)[1].lower()
+            if ext in AUDIO_EXTENSIONS:
+                files.append({
+                    'key': key,
+                    'size': obj['Size'],
+                    'filename': fname,
+                })
+        if files:
+            files.sort(key=lambda x: x['filename'])
+            return files
+        return None
+    except Exception as e:
+        logger.error("S3 cache check error: %s", e)
+        return None
+
+
+def _qbt_add_magnet(magnet: str, info_hash: str) -> bool:
+    """Add magnet link to qBittorrent with specific save path."""
+    try:
+        import httpx
+        save_path = f"{AUDIOBOOK_DOWNLOAD_DIR}/{info_hash}"
+        resp = httpx.post(
+            f"{QBITTORRENT_URL}/api/v2/torrents/add",
+            data={
+                'urls': magnet,
+                'savepath': save_path,
+                'category': 'audiobooks',
+            },
+            timeout=15,
+        )
+        if resp.status_code == 200 and resp.text.strip() in ('Ok.', 'Fails.'):
+            logger.info("qBittorrent add torrent: %s → %s", info_hash[:8], resp.text.strip())
+            return resp.text.strip() == 'Ok.'
+        logger.warning("qBittorrent add unexpected: HTTP %d %s", resp.status_code, resp.text[:100])
+        return False
+    except Exception as e:
+        logger.error("qBittorrent add error: %s", e)
+        return False
+
+
+def _qbt_get_torrent_status(info_hash: str) -> dict | None:
+    """Get torrent status from qBittorrent."""
+    try:
+        import httpx
+        resp = httpx.get(
+            f"{QBITTORRENT_URL}/api/v2/torrents/info",
+            params={'hashes': info_hash},
+            timeout=10,
+        )
+        if resp.status_code == 200:
+            torrents = resp.json()
+            if torrents:
+                t = torrents[0]
+                return {
+                    'state': t.get('state', ''),
+                    'progress': t.get('progress', 0),
+                    'size': t.get('size', 0),
+                    'downloaded': t.get('downloaded', 0),
+                    'dlspeed': t.get('dlspeed', 0),
+                    'eta': t.get('eta', 0),
+                    'num_seeds': t.get('num_seeds', 0),
+                    'save_path': t.get('save_path', ''),
+                    'name': t.get('name', ''),
+                    'content_path': t.get('content_path', ''),
+                }
+        return None
+    except Exception as e:
+        logger.error("qBittorrent status error: %s", e)
+        return None
+
+
+def _qbt_get_torrent_files(info_hash: str) -> list[dict]:
+    """Get list of files in a torrent."""
+    try:
+        import httpx
+        resp = httpx.get(
+            f"{QBITTORRENT_URL}/api/v2/torrents/files",
+            params={'hash': info_hash},
+            timeout=10,
+        )
+        if resp.status_code == 200:
+            return resp.json()
+        return []
+    except Exception as e:
+        logger.error("qBittorrent files error: %s", e)
+        return []
+
+
+def _upload_audiobook_to_s3(info_hash: str, local_dir: str) -> list[dict]:
+    """Upload audio files from local directory to S3.
+    Returns list of {key, size, filename}."""
+    s3 = _get_s3_client()
+    if not s3:
+        return []
+    uploaded = []
+    try:
+        for root, dirs, files in os.walk(local_dir):
+            for fname in sorted(files):
+                ext = os.path.splitext(fname)[1].lower()
+                if ext not in AUDIO_EXTENSIONS:
+                    continue
+                local_path = os.path.join(root, fname)
+                # Preserve relative path structure
+                rel_path = os.path.relpath(local_path, local_dir)
+                s3_key = f"{info_hash}/{rel_path}"
+                file_size = os.path.getsize(local_path)
+                logger.info("Uploading to S3: %s (%d bytes)", s3_key, file_size)
+                s3.upload_file(local_path, S3_BUCKET, s3_key)
+                uploaded.append({
+                    'key': s3_key,
+                    'size': file_size,
+                    'filename': fname,
+                })
+    except Exception as e:
+        logger.error("S3 upload error: %s", e)
+    return uploaded
+
+
+def _download_from_s3(s3_key: str, local_path: str) -> bool:
+    """Download a file from S3 to local path."""
+    s3 = _get_s3_client()
+    if not s3:
+        return False
+    try:
+        os.makedirs(os.path.dirname(local_path), exist_ok=True)
+        s3.download_file(S3_BUCKET, s3_key, local_path)
+        return True
+    except Exception as e:
+        logger.error("S3 download error: %s", e)
+        return False
+
+
+def _format_size(size_bytes: int) -> str:
+    """Format bytes to human-readable size."""
+    if size_bytes < 1024:
+        return f"{size_bytes} B"
+    elif size_bytes < 1024 * 1024:
+        return f"{size_bytes / 1024:.1f} KB"
+    elif size_bytes < 1024 * 1024 * 1024:
+        return f"{size_bytes / (1024 * 1024):.1f} MB"
+    else:
+        return f"{size_bytes / (1024 * 1024 * 1024):.2f} GB"
+
+
+def _format_eta(seconds: int) -> str:
+    """Format ETA seconds to human-readable."""
+    if seconds <= 0 or seconds >= 8640000:
+        return "∞"
+    if seconds < 60:
+        return f"{seconds}с"
+    elif seconds < 3600:
+        return f"{seconds // 60}м {seconds % 60}с"
+    else:
+        h = seconds // 3600
+        m = (seconds % 3600) // 60
+        return f"{h}ч {m}м"
+
+
+async def audiobook_download_pipeline(
+    bot,
+    chat_id: int,
+    message_id: int,
+    magnet: str,
+    info_hash: str,
+    title: str,
+):
+    """Full audiobook download pipeline:
+    1. Check S3 cache
+    2. If not cached: add to qBittorrent, wait for download
+    3. Upload to S3
+    4. Send audio files to Telegram
+    """
+    async def _edit(text: str, reply_markup=None):
+        try:
+            await bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=message_id,
+                text=text,
+                parse_mode="HTML",
+                reply_markup=reply_markup,
+            )
+        except Exception:
+            pass
+
+    # ── Step 1: Check S3 cache ──
+    await _edit(f"🔍 <b>Проверяю кэш...</b>\n\n🎧 {title[:60]}")
+    cached_files = await asyncio.to_thread(_check_s3_cache, info_hash)
+
+    if cached_files:
+        # Found in cache — send directly from S3
+        await _edit(
+            f"✅ <b>Найдено в кэше!</b>\n\n"
+            f"🎧 {title[:60]}\n"
+            f"📁 {len(cached_files)} аудиофайлов\n\n"
+            f"📤 Отправляю..."
+        )
+        await _send_audio_files_from_s3(bot, chat_id, cached_files, title)
+        return
+
+    # ── Step 2: Add to qBittorrent ──
+    await _edit(
+        f"📥 <b>Начинаю скачивание...</b>\n\n"
+        f"🎧 {title[:60]}\n"
+        f"🧲 Добавляю в торрент-клиент..."
+    )
+    added = await asyncio.to_thread(_qbt_add_magnet, magnet, info_hash)
+    if not added:
+        await _edit(
+            f"❌ <b>Не удалось добавить торрент</b>\n\n"
+            f"🎧 {title[:60]}\n\n"
+            f"🧲 <b>Magnet-ссылка:</b>\n"
+            f"<code>{magnet}</code>\n\n"
+            f"💡 Скопируйте и откройте в торрент-клиенте вручную"
+        )
+        return
+
+    # ── Step 3: Monitor download progress ──
+    await _edit(
+        f"⏳ <b>Скачивание запущено</b>\n\n"
+        f"🎧 {title[:60]}\n"
+        f"🔄 Ожидаю подключения к пирам..."
+    )
+
+    max_wait = 3600  # 1 hour max
+    poll_interval = 10  # seconds
+    elapsed = 0
+    last_progress_text = ""
+
+    while elapsed < max_wait:
+        await asyncio.sleep(poll_interval)
+        elapsed += poll_interval
+
+        status = await asyncio.to_thread(_qbt_get_torrent_status, info_hash)
+        if not status:
+            if elapsed > 120:
+                await _edit(
+                    f"⚠️ <b>Торрент не найден</b>\n\n"
+                    f"🎧 {title[:60]}\n"
+                    f"Возможно, скачивание не началось. Попробуйте позже."
+                )
+                return
+            continue
+
+        state = status['state']
+        progress = status['progress']
+        dlspeed = status['dlspeed']
+        eta = status['eta']
+        seeds = status['num_seeds']
+
+        # Check if completed
+        if state in ('uploading', 'pausedUP', 'stalledUP', 'queuedUP', 'forcedUP') or progress >= 1.0:
+            break
+
+        # Update progress message (not too often)
+        progress_pct = int(progress * 100)
+        speed_str = _format_size(dlspeed) + "/с" if dlspeed > 0 else "—"
+        eta_str = _format_eta(eta)
+        bar_filled = int(progress_pct / 5)
+        bar = "█" * bar_filled + "░" * (20 - bar_filled)
+
+        progress_text = (
+            f"📥 <b>Скачивание аудиокниги</b>\n\n"
+            f"🎧 {title[:50]}\n\n"
+            f"[{bar}] {progress_pct}%\n"
+            f"⚡ {speed_str} | 🌱 Seeds: {seeds}\n"
+            f"⏱ ETA: {eta_str}"
+        )
+
+        if progress_text != last_progress_text:
+            await _edit(progress_text)
+            last_progress_text = progress_text
+
+        # Slow down polling for large files
+        if elapsed > 60:
+            poll_interval = 15
+        if elapsed > 300:
+            poll_interval = 30
+    else:
+        # Timeout
+        await _edit(
+            f"⏰ <b>Превышено время ожидания (1 час)</b>\n\n"
+            f"🎧 {title[:60]}\n\n"
+            f"Скачивание продолжается в фоне. Попробуйте запросить снова позже."
+        )
+        return
+
+    # ── Step 4: Upload to S3 ──
+    await _edit(
+        f"☁️ <b>Загружаю в облако...</b>\n\n"
+        f"🎧 {title[:60]}\n"
+        f"📦 Кэширую для быстрого доступа..."
+    )
+
+    # Find the actual download path
+    status = await asyncio.to_thread(_qbt_get_torrent_status, info_hash)
+    content_path = status.get('content_path', '') if status else ''
+    save_path = status.get('save_path', '') if status else ''
+
+    # The files should be in /downloads/audiobooks/{info_hash}/
+    local_dir = f"{AUDIOBOOK_DOWNLOAD_DIR}/{info_hash}"
+    if content_path and os.path.isdir(content_path):
+        local_dir = content_path
+    elif content_path and os.path.isfile(content_path):
+        local_dir = os.path.dirname(content_path)
+    elif save_path:
+        local_dir = save_path
+
+    uploaded = await asyncio.to_thread(_upload_audiobook_to_s3, info_hash, local_dir)
+
+    if not uploaded:
+        # Try to send files directly from disk
+        await _edit(
+            f"⚠️ <b>Не удалось загрузить в облако</b>\n\n"
+            f"🎧 {title[:60]}\n"
+            f"📤 Отправляю файлы напрямую..."
+        )
+        await _send_audio_files_from_disk(bot, chat_id, local_dir, title)
+        return
+
+    # Update cache
+    cache = _load_audiobook_cache()
+    cache[info_hash] = {
+        'title': title,
+        's3_prefix': f"{info_hash}/",
+        'files': [f['filename'] for f in uploaded],
+        'total_size': sum(f['size'] for f in uploaded),
+        'timestamp': datetime.now(TIMEZONE).isoformat(),
+    }
+    _save_audiobook_cache(cache)
+
+    # ── Step 5: Send audio files to Telegram ──
+    await _edit(
+        f"✅ <b>Скачано и закэшировано!</b>\n\n"
+        f"🎧 {title[:60]}\n"
+        f"📁 {len(uploaded)} файлов ({_format_size(sum(f['size'] for f in uploaded))})\n\n"
+        f"📤 Отправляю аудиофайлы..."
+    )
+    await _send_audio_files_from_s3(bot, chat_id, uploaded, title)
+
+    # Clean up torrent (optional: pause seeding)
+    try:
+        import httpx
+        httpx.post(
+            f"{QBITTORRENT_URL}/api/v2/torrents/pause",
+            data={'hashes': info_hash},
+            timeout=5,
+        )
+    except Exception:
+        pass
+
+
+async def _send_audio_files_from_s3(
+    bot, chat_id: int, files: list[dict], title: str
+):
+    """Download files from S3 and send to Telegram as audio."""
+    tmp_dir = f"/tmp/audiobook_{uuid.uuid4().hex[:8]}"
+    os.makedirs(tmp_dir, exist_ok=True)
+
+    sent_count = 0
+    total = len(files)
+
+    # Sort files by filename for correct order
+    files_sorted = sorted(files, key=lambda x: x['filename'])
+
+    for i, f in enumerate(files_sorted):
+        local_path = os.path.join(tmp_dir, f['filename'])
+        ok = await asyncio.to_thread(_download_from_s3, f['key'], local_path)
+        if not ok:
+            continue
+
+        file_size = os.path.getsize(local_path)
+        if file_size > TELEGRAM_MAX_AUDIO_SIZE:
+            # Send as document for large files
+            try:
+                with open(local_path, 'rb') as audio_file:
+                    await bot.send_document(
+                        chat_id=chat_id,
+                        document=audio_file,
+                        filename=f['filename'],
+                        caption=f"🎧 {title[:40]} — {f['filename']}\n📦 {_format_size(file_size)}",
+                    )
+                sent_count += 1
+            except Exception as e:
+                logger.error("Telegram send document error: %s", e)
+        else:
+            # Send as audio
+            try:
+                # Extract track info from filename
+                track_title = os.path.splitext(f['filename'])[0]
+                with open(local_path, 'rb') as audio_file:
+                    await bot.send_audio(
+                        chat_id=chat_id,
+                        audio=audio_file,
+                        title=track_title,
+                        performer=title[:40],
+                        caption=f"📖 {i+1}/{total}",
+                    )
+                sent_count += 1
+            except Exception as e:
+                logger.error("Telegram send audio error: %s", e)
+                # Fallback: try as document
+                try:
+                    with open(local_path, 'rb') as audio_file:
+                        await bot.send_document(
+                            chat_id=chat_id,
+                            document=audio_file,
+                            filename=f['filename'],
+                        )
+                    sent_count += 1
+                except Exception:
+                    pass
+
+        # Clean up temp file after sending
+        try:
+            os.remove(local_path)
+        except Exception:
+            pass
+
+    # Clean up temp dir
+    try:
+        os.rmdir(tmp_dir)
+    except Exception:
+        pass
+
+    if sent_count > 0:
+        try:
+            await bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    f"✅ <b>Аудиокнига отправлена!</b>\n\n"
+                    f"🎧 {title[:60]}\n"
+                    f"📁 {sent_count}/{total} файлов\n\n"
+                    f"💡 При повторном запросе файлы будут отправлены мгновенно из кэша."
+                ),
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
+    else:
+        try:
+            await bot.send_message(
+                chat_id=chat_id,
+                text=f"❌ Не удалось отправить аудиофайлы для: {title[:60]}",
+            )
+        except Exception:
+            pass
+
+
+async def _send_audio_files_from_disk(
+    bot, chat_id: int, local_dir: str, title: str
+):
+    """Send audio files directly from local disk to Telegram."""
+    sent_count = 0
+    audio_files = []
+
+    for root, dirs, files in os.walk(local_dir):
+        for fname in sorted(files):
+            ext = os.path.splitext(fname)[1].lower()
+            if ext in AUDIO_EXTENSIONS:
+                audio_files.append(os.path.join(root, fname))
+
+    total = len(audio_files)
+    for i, fpath in enumerate(audio_files):
+        file_size = os.path.getsize(fpath)
+        fname = os.path.basename(fpath)
+
+        if file_size > TELEGRAM_MAX_AUDIO_SIZE:
+            try:
+                with open(fpath, 'rb') as f:
+                    await bot.send_document(
+                        chat_id=chat_id,
+                        document=f,
+                        filename=fname,
+                        caption=f"🎧 {title[:40]} — {fname}",
+                    )
+                sent_count += 1
+            except Exception as e:
+                logger.error("Send from disk error: %s", e)
+        else:
+            try:
+                track_title = os.path.splitext(fname)[0]
+                with open(fpath, 'rb') as f:
+                    await bot.send_audio(
+                        chat_id=chat_id,
+                        audio=f,
+                        title=track_title,
+                        performer=title[:40],
+                        caption=f"📖 {i+1}/{total}",
+                    )
+                sent_count += 1
+            except Exception as e:
+                logger.error("Send audio from disk error: %s", e)
+
+    if sent_count > 0:
+        await bot.send_message(
+            chat_id=chat_id,
+            text=f"✅ <b>Отправлено {sent_count}/{total} аудиофайлов</b>\n🎧 {title[:60]}",
+            parse_mode="HTML",
+        )
 
 
 def download_book(book_id: int, fmt: str = "epub") -> tuple[bytes | None, str]:
@@ -3290,7 +3883,7 @@ async def cmd_book(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def callback_audiobook(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle audiobook selection callback — get magnet link."""
+    """Handle audiobook selection callback — download and send audio files."""
     query = update.callback_query
     await query.answer()
 
@@ -3298,6 +3891,45 @@ async def callback_audiobook(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if data == "abook:cancel":
         await query.edit_message_text("❌ Поиск отменён")
         context.user_data.pop("audiobook_search_results", None)
+        return
+
+    # Handle magnet show callback: abook:mag:{index}
+    if data.startswith("abook:mag:"):
+        ab_data = context.user_data.get("audiobook_download_data", {})
+        magnet = ab_data.get("magnet", "")
+        title = ab_data.get("title", "")
+        if magnet:
+            await query.edit_message_text(
+                f"\U0001f3a7 <b>{title[:60]}</b>\n\n"
+                f"\U0001f9f2 <b>Magnet-\u0441\u0441\u044b\u043b\u043a\u0430:</b>\n"
+                f"<code>{magnet}</code>\n\n"
+                f"\U0001f4a1 \u0421\u043a\u043e\u043f\u0438\u0440\u0443\u0439\u0442\u0435 \u0438 \u043e\u0442\u043a\u0440\u043e\u0439\u0442\u0435 \u0432 \u0442\u043e\u0440\u0440\u0435\u043d\u0442-\u043a\u043b\u0438\u0435\u043d\u0442\u0435",
+                parse_mode="HTML",
+            )
+        else:
+            await query.edit_message_text("\u274c \u0414\u0430\u043d\u043d\u044b\u0435 \u0443\u0441\u0442\u0430\u0440\u0435\u043b\u0438. \u041f\u043e\u0432\u0442\u043e\u0440\u0438\u0442\u0435 \u043f\u043e\u0438\u0441\u043a.")
+        return
+
+    # Handle download callback: abook:dl:{info_hash}
+    if data.startswith("abook:dl:"):
+        info_hash = data.split(":", 2)[2]
+        ab_data = context.user_data.get("audiobook_download_data", {})
+        magnet = ab_data.get("magnet", "")
+        title = ab_data.get("title", "Аудиокнига")
+        if not magnet:
+            await query.edit_message_text("❌ Данные устарели. Повторите поиск.")
+            return
+        # Launch download pipeline in background
+        asyncio.create_task(
+            audiobook_download_pipeline(
+                bot=context.bot,
+                chat_id=query.message.chat_id,
+                message_id=query.message.message_id,
+                magnet=magnet,
+                info_hash=info_hash,
+                title=title,
+            )
+        )
         return
 
     # Parse callback: abook:{index}:magnet
@@ -3334,6 +3966,21 @@ async def callback_audiobook(update: Update, context: ContextTypes.DEFAULT_TYPE)
         magnet = None
 
     if magnet:
+        info_hash = _extract_info_hash(magnet)
+        if not info_hash:
+            info_hash = ab.get("topic_id", "unknown")
+
+        # Store download data for the download callback
+        context.user_data["audiobook_download_data"] = {
+            "magnet": magnet,
+            "title": ab["title"],
+            "info_hash": info_hash,
+        }
+
+        # Check if already cached
+        cached = await asyncio.to_thread(_check_s3_cache, info_hash)
+        cache_status = "✅ Есть в кэше — отправлю мгновенно!" if cached else "⏳ Скачаю и отправлю"
+
         text = (
             f"\U0001f3a7 <b>{ab['title'][:60]}</b>\n\n"
             f"\U0001f4e6 Размер: {ab['size']}\n"
@@ -3341,11 +3988,23 @@ async def callback_audiobook(update: Update, context: ContextTypes.DEFAULT_TYPE)
             f"\U0001f4c1 Раздел: {ab['forum']}\n"
             f"\U0001f4c5 Дата: {ab['date']}\n\n"
             f"\U0001f517 <a href=\"{ab['url']}\">Страница раздачи</a>\n\n"
-            f"\U0001f9f2 <b>Magnet-ссылка:</b>\n"
-            f"<code>{magnet}</code>\n\n"
-            f"\U0001f4a1 Скопируйте magnet-ссылку и откройте в торрент-клиенте"
+            f"{cache_status}"
         )
-        await query.edit_message_text(text, parse_mode="HTML")
+        keyboard = [
+            [InlineKeyboardButton(
+                "\U0001f4e5 Скачать и прослушать",
+                callback_data=f"abook:dl:{info_hash}"
+            )],
+            [InlineKeyboardButton(
+                "\U0001f9f2 Показать magnet-ссылку",
+                callback_data=f"abook:mag:{ab_idx}"
+            )],
+        ]
+        await query.edit_message_text(
+            text,
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
     else:
         # Fallback: send direct link to topic
         await query.edit_message_text(
