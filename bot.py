@@ -1241,17 +1241,29 @@ async def audiobook_download_pipeline(
                 parse_mode="HTML",
                 reply_markup=reply_markup,
             )
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("Pipeline _edit error: %s", e)
 
     # ── Step 1: Check S3 cache ──
+    logger.info("Audiobook pipeline started: hash=%s title=%s", info_hash, title[:40])
     await _edit(f"🔍 <b>Проверяю кэш...</b>\n\n🎧 {title[:60]}")
-    cached_files = await asyncio.to_thread(_check_s3_cache, info_hash)
+    try:
+        cached_files = await asyncio.to_thread(_check_s3_cache, info_hash)
+    except Exception as e:
+        logger.error("S3 cache check failed: %s", e)
+        cached_files = None
+    logger.info("Audiobook cache result: %s files", len(cached_files) if cached_files else 0)
 
     if cached_files:
         # Found in cache — send Mini App button
+        logger.info("Audiobook found in cache: %d files", len(cached_files))
         webapp_url = f"https://bot.nodkeys.com/audiobook/player?hash={info_hash}"
         download_url = f"https://bot.nodkeys.com/audiobook/download/{info_hash}"
+        total_size = 0
+        try:
+            total_size = sum(f['size'] for f in cached_files)
+        except Exception as e:
+            logger.error("Cache size calc error: %s, files sample: %s", e, cached_files[:2])
         keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton(
                 "\U0001f3a7 Открыть плеер",
@@ -1262,22 +1274,43 @@ async def audiobook_download_pipeline(
                 url=download_url,
             )],
         ])
-        await _edit(
-            f"\u2705 <b>Аудиокнига готова!</b>\n\n"
-            f"\U0001f3a7 {title[:60]}\n"
-            f"\U0001f4c1 {len(cached_files)} аудиофайлов ({_format_size(sum(f['size'] for f in cached_files))})\n\n"
-            f"\U0001f4a1 Нажмите <b>\"Открыть плеер\"</b> для прослушивания прямо в Telegram.",
-            reply_markup=keyboard,
-        )
+        try:
+            await _edit(
+                f"\u2705 <b>Аудиокнига готова!</b>\n\n"
+                f"\U0001f3a7 {title[:60]}\n"
+                f"\U0001f4c1 {len(cached_files)} аудиофайлов ({_format_size(total_size)})\n\n"
+                f"\U0001f4a1 Нажмите <b>\"Открыть плеер\"</b> для прослушивания прямо в Telegram.",
+                reply_markup=keyboard,
+            )
+        except Exception as e:
+            logger.error("Failed to send Mini App button: %s", e)
+            # Fallback: send as new message
+            try:
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=(
+                        f"\u2705 <b>Аудиокнига готова!</b>\n\n"
+                        f"\U0001f3a7 {title[:60]}\n"
+                        f"\U0001f4c1 {len(cached_files)} аудиофайлов ({_format_size(total_size)})\n\n"
+                        f"\U0001f517 <a href=\"{download_url}\">Скачать все файлы</a>\n\n"
+                        f"\U0001f4a1 Нажмите <b>\"Открыть плеер\"</b> для прослушивания."
+                    ),
+                    parse_mode="HTML",
+                    reply_markup=keyboard,
+                )
+            except Exception as e2:
+                logger.error("Fallback send also failed: %s", e2)
         return
 
     # ── Step 2: Add to qBittorrent ──
+    logger.info("Pipeline step 2: adding to qBittorrent hash=%s", info_hash)
     await _edit(
         f"📥 <b>Начинаю скачивание...</b>\n\n"
         f"🎧 {title[:60]}\n"
         f"🧲 Добавляю в торрент-клиент..."
     )
     added = await asyncio.to_thread(_qbt_add_magnet, magnet, info_hash)
+    logger.info("Pipeline step 2 result: added=%s", added)
     if not added:
         await _edit(
             f"❌ <b>Не удалось добавить торрент</b>\n\n"
@@ -1359,6 +1392,7 @@ async def audiobook_download_pipeline(
         return
 
     # ── Step 4: Upload to S3 ──
+    logger.info("Pipeline step 4: uploading to S3 hash=%s", info_hash)
     await _edit(
         f"☁️ <b>Загружаю в облако...</b>\n\n"
         f"🎧 {title[:60]}\n"
@@ -1379,7 +1413,9 @@ async def audiobook_download_pipeline(
     elif save_path:
         local_dir = save_path
 
+    logger.info("Pipeline step 4: local_dir=%s, exists=%s", local_dir, os.path.isdir(local_dir))
     uploaded = await asyncio.to_thread(_upload_audiobook_to_s3, info_hash, local_dir)
+    logger.info("Pipeline step 4 result: %d files uploaded", len(uploaded) if uploaded else 0)
 
     if not uploaded:
         # Try to send files directly from disk
@@ -1403,6 +1439,7 @@ async def audiobook_download_pipeline(
     _save_audiobook_cache(cache)
 
     # ── Step 5: Send Mini App button ──
+    logger.info("Pipeline step 5: sending Mini App button")
     webapp_url = f"https://bot.nodkeys.com/audiobook/player?hash={info_hash}"
     download_url = f"https://bot.nodkeys.com/audiobook/download/{info_hash}"
     keyboard = InlineKeyboardMarkup([
@@ -4074,23 +4111,38 @@ async def callback_audiobook(update: Update, context: ContextTypes.DEFAULT_TYPE)
     # Handle download callback: abook:dl:{info_hash}
     if data.startswith("abook:dl:"):
         info_hash = data.split(":", 2)[2]
+        logger.info("abook:dl callback: hash=%s", info_hash)
         ab_data = context.user_data.get("audiobook_download_data", {})
         magnet = ab_data.get("magnet", "")
         title = ab_data.get("title", "Аудиокнига")
+        logger.info("abook:dl data: magnet=%s title=%s", bool(magnet), title[:40] if title else "?")
         if not magnet:
+            logger.warning("abook:dl: no magnet in user_data, keys=%s", list(ab_data.keys()))
             await query.edit_message_text("❌ Данные устарели. Повторите поиск.")
             return
         # Launch download pipeline in background
-        asyncio.create_task(
-            audiobook_download_pipeline(
-                bot=context.bot,
-                chat_id=query.message.chat_id,
-                message_id=query.message.message_id,
-                magnet=magnet,
-                info_hash=info_hash,
-                title=title,
-            )
-        )
+        logger.info("abook:dl: launching pipeline for %s", info_hash)
+        async def _safe_pipeline():
+            try:
+                await audiobook_download_pipeline(
+                    bot=context.bot,
+                    chat_id=query.message.chat_id,
+                    message_id=query.message.message_id,
+                    magnet=magnet,
+                    info_hash=info_hash,
+                    title=title,
+                )
+            except Exception as e:
+                logger.error("PIPELINE CRASHED: %s", e, exc_info=True)
+                try:
+                    await context.bot.send_message(
+                        chat_id=query.message.chat_id,
+                        text=f"❌ <b>Ошибка pipeline</b>\n\n<code>{str(e)[:300]}</code>",
+                        parse_mode="HTML",
+                    )
+                except Exception:
+                    pass
+        asyncio.create_task(_safe_pipeline())
         return
 
     # Parse callback: abook:{index}:magnet
