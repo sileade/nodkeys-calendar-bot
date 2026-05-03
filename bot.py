@@ -8578,6 +8578,12 @@ a.dl:hover {{ background: #4ade80; color: #1a1c2e; }}
             self.send_header('Access-Control-Allow-Origin', '*')
             self.end_headers()
             self.wfile.write(json.dumps(data, ensure_ascii=False).encode())
+        elif self.path == '/api/shortcuts/list':
+            if NEW_MODULES_LOADED:
+                shortcuts = get_shortcuts_list()
+                self._json_response(200, {'ok': True, 'shortcuts': shortcuts})
+            else:
+                self._json_response(503, {'ok': False, 'error': 'Shortcuts not available'})
         else:
             self.send_response(404)
             self.end_headers()
