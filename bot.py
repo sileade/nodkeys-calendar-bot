@@ -4155,7 +4155,7 @@ async def callback_audiobook(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     # ── Play track: abook:play:{hash}:{idx} ──
     if data.startswith("abook:play:"):
-        await query.answer("\u23f3 \u0417\u0430\u0433\u0440\u0443\u0436\u0430\u044e 10 \u0433\u043b\u0430\u0432...")
+        await query.answer("\u23f3 \u0417\u0430\u0433\u0440\u0443\u0436\u0430\u044e \u0433\u043b\u0430\u0432\u044b...")
         parts = data.split(":")
         info_hash = parts[2]
         track_idx = int(parts[3])
@@ -4175,42 +4175,91 @@ async def callback_audiobook(update: Update, context: ContextTypes.DEFAULT_TYPE)
         try:
             # Send up to BATCH_SIZE tracks starting from track_idx
             end_idx = min(track_idx + BATCH_SIZE, len(files))
+            last_sent_idx = None  # Track the last successfully sent file index
             for i in range(track_idx, end_idx):
                 f = files[i]
                 s3_key = f.get('key', '')
                 filename = f.get('filename', f'track_{i}.mp3')
+                file_size = f.get('size', 0)
                 local_path = os.path.join(tmp_dir, filename)
                 ok = await asyncio.to_thread(_download_from_s3, s3_key, local_path)
                 if not ok:
+                    logger.warning("abook:play S3 download failed for %s", s3_key)
                     continue
-                # Last track in batch gets "Next 10 chapters" button
-                if i == end_idx - 1 and end_idx < len(files):
+                # Determine if file is too large for send_audio (Telegram limit ~50MB)
+                actual_size = os.path.getsize(local_path) if os.path.exists(local_path) else file_size
+                is_large = actual_size > TELEGRAM_MAX_AUDIO_SIZE
+                try:
+                    with open(local_path, 'rb') as audio_file:
+                        if is_large:
+                            # Send as document for files > 49MB
+                            await context.bot.send_document(
+                                chat_id=query.message.chat_id,
+                                document=audio_file,
+                                filename=filename,
+                                caption=f"\U0001f3a7 {title[:50]}\n\U0001f4c4 {filename} ({i + 1}/{len(files)})\n\u26a0\ufe0f \u0411\u043e\u043b\u044c\u0448\u043e\u0439 \u0444\u0430\u0439\u043b ({_format_size(actual_size)})",
+                            )
+                        else:
+                            await context.bot.send_audio(
+                                chat_id=query.message.chat_id,
+                                audio=audio_file,
+                                title=filename,
+                                performer=title[:40],
+                                caption=f"\U0001f3a7 {title[:50]}\n\U0001f4c4 {filename} ({i + 1}/{len(files)})",
+                            )
+                    last_sent_idx = i
+                except Exception as send_err:
+                    logger.error("abook:play send error for %s (size=%d): %s", filename, actual_size, send_err)
+                    # If send_audio fails (e.g. file too large despite check), try as document
+                    if not is_large:
+                        try:
+                            with open(local_path, 'rb') as audio_file:
+                                await context.bot.send_document(
+                                    chat_id=query.message.chat_id,
+                                    document=audio_file,
+                                    filename=filename,
+                                    caption=f"\U0001f3a7 {title[:50]}\n\U0001f4c4 {filename} ({i + 1}/{len(files)})",
+                                )
+                            last_sent_idx = i
+                        except Exception as doc_err:
+                            logger.error("abook:play document fallback also failed: %s", doc_err)
+                # Clean up file after sending
+                try:
+                    os.remove(local_path)
+                except Exception:
+                    pass
+            # Send "Load more" button after the batch
+            if last_sent_idx is not None:
+                if end_idx < len(files):
                     next_kb = InlineKeyboardMarkup([
                         [InlineKeyboardButton(
                             f"\u23ed\ufe0f \u0421\u043b\u0435\u0434\u0443\u044e\u0449\u0438\u0435 10 \u0433\u043b\u0430\u0432 ({end_idx + 1}/{len(files)})",
                             callback_data=f"abook:play:{info_hash}:{end_idx}"
                         )]
                     ])
-                elif i == end_idx - 1:
+                else:
                     next_kb = InlineKeyboardMarkup([
                         [InlineKeyboardButton("\u2705 \u041a\u043d\u0438\u0433\u0430 \u0437\u0430\u0432\u0435\u0440\u0448\u0435\u043d\u0430", callback_data=f"abook:done:{info_hash}")]
                     ])
-                else:
-                    next_kb = None
-                with open(local_path, 'rb') as audio_file:
-                    await context.bot.send_audio(
-                        chat_id=query.message.chat_id,
-                        audio=audio_file,
-                        title=filename,
-                        performer=title[:40],
-                        caption=f"\U0001f3a7 {title[:50]}\n\U0001f4c4 {filename} ({i + 1}/{len(files)})",
-                        reply_markup=next_kb,
-                    )
-                # Clean up file after sending
-                try:
-                    os.remove(local_path)
-                except Exception:
-                    pass
+                # Send the "load more" button as a separate message
+                await context.bot.send_message(
+                    chat_id=query.message.chat_id,
+                    text=f"\U0001f4e4 \u041e\u0442\u043f\u0440\u0430\u0432\u043b\u0435\u043d\u043e {last_sent_idx - track_idx + 1} \u0438\u0437 {len(files)} \u0433\u043b\u0430\u0432",
+                    reply_markup=next_kb,
+                )
+            elif end_idx < len(files):
+                # Nothing sent in this batch (all failed), offer to skip ahead
+                skip_kb = InlineKeyboardMarkup([
+                    [InlineKeyboardButton(
+                        f"\u23ed\ufe0f \u041f\u0440\u043e\u043f\u0443\u0441\u0442\u0438\u0442\u044c \u0438 \u043f\u0440\u043e\u0434\u043e\u043b\u0436\u0438\u0442\u044c ({end_idx + 1}/{len(files)})",
+                        callback_data=f"abook:play:{info_hash}:{end_idx}"
+                    )]
+                ])
+                await context.bot.send_message(
+                    chat_id=query.message.chat_id,
+                    text=f"\u26a0\ufe0f \u041d\u0435 \u0443\u0434\u0430\u043b\u043e\u0441\u044c \u043e\u0442\u043f\u0440\u0430\u0432\u0438\u0442\u044c \u0433\u043b\u0430\u0432\u044b {track_idx+1}-{end_idx}. \u0424\u0430\u0439\u043b\u044b \u0441\u043b\u0438\u0448\u043a\u043e\u043c \u0431\u043e\u043b\u044c\u0448\u0438\u0435.",
+                    reply_markup=skip_kb,
+                )
             # Update main message keyboard to reflect new position
             if end_idx < len(files):
                 webapp_url = f"https://bot.nodkeys.com/audiobook/player?hash={info_hash}"
@@ -4452,12 +4501,30 @@ async def callback_audiobook(update: Update, context: ContextTypes.DEFAULT_TYPE)
         parse_mode="HTML",
     )
 
-    # Get magnet link
-    try:
-        magnet = await asyncio.to_thread(get_audiobook_magnet, ab["topic_id"])
-    except Exception as e:
-        logger.error("Audiobook magnet error: %s", e)
-        magnet = None
+    # Get magnet link with fallback to next results
+    magnet = None
+    selected_ab = ab
+    candidates = [ab_idx] + [i for i in range(len(results)) if i != ab_idx][:4]
+    for try_idx in candidates:
+        candidate = results[try_idx]
+        try:
+            magnet = await asyncio.to_thread(get_audiobook_magnet, candidate["topic_id"])
+        except Exception as e:
+            logger.error("Audiobook magnet error for topic %s: %s", candidate["topic_id"], e)
+            magnet = None
+        if magnet:
+            selected_ab = candidate
+            if try_idx != ab_idx:
+                logger.info("Magnet fallback: original topic %s failed, using topic %s", ab["topic_id"], candidate["topic_id"])
+                await query.edit_message_text(
+                    f"\u23f3 Получаю ссылку...\n\n"
+                    f"\U0001f3a7 <b>{selected_ab['title'][:60]}</b>\n"
+                    f"\U0001f4e6 {selected_ab['size']} | \U0001f331 Seeds: {selected_ab['seeds']}\n\n"
+                    f"\u2139\ufe0f Использую альтернативную раздачу (у первой нет magnet)",
+                    parse_mode="HTML",
+                )
+            break
+    ab = selected_ab
 
     if magnet:
         info_hash = _extract_info_hash(magnet)
@@ -4500,10 +4567,10 @@ async def callback_audiobook(update: Update, context: ContextTypes.DEFAULT_TYPE)
             reply_markup=InlineKeyboardMarkup(keyboard),
         )
     else:
-        # Fallback: send direct link to topic
+        # Fallback: send direct link to topic (all candidates failed)
         await query.edit_message_text(
             f"\U0001f3a7 <b>{ab['title'][:60]}</b>\n\n"
-            f"\u26a0\ufe0f Magnet-ссылка не найдена\n\n"
+            f"\u26a0\ufe0f Magnet-ссылка не найдена (проверено {len(candidates)} раздач)\n\n"
             f"\U0001f517 <a href=\"{ab['url']}\">Открыть на RuTracker</a>\n"
             f"(скачайте .torrent файл вручную)",
             parse_mode="HTML",
