@@ -4181,6 +4181,32 @@ async def callback_audiobook(update: Update, context: ContextTypes.DEFAULT_TYPE)
                     caption=f"\ud83c\udfa7 {title[:50]}\n\ud83d\udcc4 {filename} ({track_idx + 1}/{len(files)})",
                     reply_markup=next_kb,
                 )
+            # Auto-send next chapter immediately
+            if next_idx < len(files):
+                f2 = files[next_idx]
+                s3_key2 = f2.get('key', '')
+                filename2 = f2.get('filename', f'track_{next_idx}.mp3')
+                local_path2 = os.path.join(tmp_dir, filename2)
+                ok2 = await asyncio.to_thread(_download_from_s3, s3_key2, local_path2)
+                if ok2:
+                    next_idx2 = next_idx + 1
+                    if next_idx2 < len(files):
+                        next_kb2 = InlineKeyboardMarkup([
+                            [InlineKeyboardButton(f"\u23ed\ufe0f \u0421\u043b\u0435\u0434\u0443\u044e\u0449\u0430\u044f \u0433\u043b\u0430\u0432\u0430 ({next_idx2 + 1}/{len(files)})", callback_data=f"abook:play:{info_hash}:{next_idx2}")]
+                        ])
+                    else:
+                        next_kb2 = InlineKeyboardMarkup([
+                            [InlineKeyboardButton("\u2705 \u041a\u043d\u0438\u0433\u0430 \u0437\u0430\u0432\u0435\u0440\u0448\u0435\u043d\u0430", callback_data=f"abook:done:{info_hash}")]
+                        ])
+                    with open(local_path2, 'rb') as audio_file2:
+                        await context.bot.send_audio(
+                            chat_id=query.message.chat_id,
+                            audio=audio_file2,
+                            title=f"{filename2}",
+                            performer=title[:40],
+                            caption=f"\ud83c\udfa7 {title[:50]}\n\ud83d\udcc4 {filename2} ({next_idx + 1}/{len(files)})",
+                            reply_markup=next_kb2,
+                        )
         except Exception as e:
             logger.error("abook:play error: %s", e)
             await query.answer(f"❌ Ошибка: {str(e)[:100]}", show_alert=True)
