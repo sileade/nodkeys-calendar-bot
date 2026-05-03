@@ -15,7 +15,7 @@ Telegram bot that analyzes messages using Claude AI and routes them:
 - All through natural language — no commands needed
 """
 
-VERSION = "9.5"
+VERSION = "10.0"
 
 import os
 import re
@@ -48,6 +48,24 @@ from telegram.ext import (
     filters,
     ContextTypes,
 )
+
+# --- New modules (v10.0): E2E encryption, subscriptions, onboarding, shortcuts ---
+try:
+    from crypto import encrypt_json, decrypt_json, generate_api_token, verify_api_token, get_user_fingerprint
+    from user_store import (
+        get_user, create_user, update_user, get_user_settings, save_user_settings,
+        is_subscription_active, get_user_plan, activate_subscription, check_limit,
+        set_custom_bot_token, get_custom_bot_token, PLANS
+    )
+    from subscription import cmd_subscribe, callback_subscribe, precheckout_handler, successful_payment_handler
+    from onboarding import cmd_settings, callback_settings, handle_settings_input
+    from shortcuts_api import ShortcutsAPIHandler, handle_shortcut_request, get_shortcuts_list, generate_shortcut_instructions
+    from user_bots import start_all_user_bots, start_user_bot, get_active_bots_count
+    NEW_MODULES_LOADED = True
+except ImportError as _import_err:
+    import traceback as _tb
+    _tb.print_exc()
+    NEW_MODULES_LOADED = False
 
 # ──────────────────── Configuration ────────────────────
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
@@ -8568,6 +8586,86 @@ a.dl:hover {{ background: #4ade80; color: #1a1c2e; }}
       except Exception as e:
           logger.warning("Health handler error: %s", e)
     
+    def do_POST(self):
+      """Handle POST requests for Shortcuts API."""
+      try:
+        content_length = int(self.headers.get('Content-Length', 0))
+        body = self.rfile.read(content_length) if content_length > 0 else b''
+        
+        if self.path == '/api/shortcut':
+            # Shortcuts API endpoint
+            auth_header = self.headers.get('Authorization', '')
+            if not auth_header.startswith('Bearer '):
+                self._json_response(401, {'ok': False, 'error': 'Authorization required'})
+                return
+            
+            token = auth_header[7:]
+            # Verify token
+            user_id = None
+            if NEW_MODULES_LOADED:
+                from user_store import _load_users
+                users = _load_users()
+                for uid, user in users.items():
+                    if user.get('api_token') == token:
+                        user_id = int(uid)
+                        break
+            
+            if not user_id:
+                self._json_response(401, {'ok': False, 'error': 'Invalid token'})
+                return
+            
+            try:
+                data = json.loads(body)
+            except Exception:
+                self._json_response(400, {'ok': False, 'error': 'Invalid JSON'})
+                return
+            
+            command = data.get('command', '')
+            text = data.get('text', '')
+            
+            if not command or not text:
+                self._json_response(400, {'ok': False, 'error': 'Missing command or text'})
+                return
+            
+            # Queue the command for async processing
+            self._json_response(202, {
+                'ok': True,
+                'status': 'processing',
+                'message': f'Command {command} queued',
+                'user_id': user_id,
+                'command': command,
+            })
+        
+        elif self.path == '/api/shortcuts/list':
+            if NEW_MODULES_LOADED:
+                shortcuts = get_shortcuts_list()
+                self._json_response(200, {'ok': True, 'shortcuts': shortcuts})
+            else:
+                self._json_response(503, {'ok': False, 'error': 'Shortcuts not available'})
+        
+        else:
+            self._json_response(404, {'ok': False, 'error': 'Not found'})
+      except BrokenPipeError:
+          pass
+      except Exception as e:
+          logger.warning("POST handler error: %s", e)
+    
+    def do_OPTIONS(self):
+      """Handle CORS preflight."""
+      self.send_response(204)
+      self.send_header('Access-Control-Allow-Origin', '*')
+      self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
+      self.send_header('Access-Control-Allow-Headers', 'Authorization, Content-Type')
+      self.end_headers()
+    
+    def _json_response(self, status, data):
+      """Send JSON response."""
+      self.send_response(status)
+      self.send_header('Content-Type', 'application/json')
+      self.send_header('Access-Control-Allow-Origin', '*')
+      self.end_headers()
+      self.wfile.write(json.dumps(data, ensure_ascii=False).encode())
+    
     def log_message(self, format, *args):
         pass  # Suppress health check logs
 
@@ -8926,6 +9024,39 @@ def main():
     app.add_handler(CallbackQueryHandler(callback_finance, pattern=r"^fin:"))
     app.add_handler(CallbackQueryHandler(callback_bookdev, pattern=r"^bookdev:"))
     app.add_handler(CallbackQueryHandler(callback_urlkindle, pattern=r"^urlkindle:"))
+
+    # --- v10.0: Settings, Subscription, Shortcuts handlers ---
+    if NEW_MODULES_LOADED:
+        app.add_handler(CommandHandler("settings", cmd_settings))
+        app.add_handler(CommandHandler("subscribe", cmd_subscribe))
+        app.add_handler(CallbackQueryHandler(callback_settings, pattern=r"^(onb:|set:)"))
+        app.add_handler(CallbackQueryHandler(callback_subscribe, pattern=r"^sub:"))
+        # Payment handlers
+        from telegram.ext import PreCheckoutQueryHandler
+        app.add_handler(PreCheckoutQueryHandler(precheckout_handler))
+        app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_handler))
+        # Shortcuts command
+        async def cmd_shortcuts(update: Update, context: ContextTypes.DEFAULT_TYPE):
+            user_id = update.effective_user.id
+            user = get_user(user_id)
+            if not user:
+                create_user(user_id, update.effective_user.first_name or "User")
+                user = get_user(user_id)
+            token = user.get('api_token')
+            if not token:
+                token = generate_api_token(user_id)
+                update_user(user_id, api_token=token)
+            shortcuts = get_shortcuts_list()
+            msg = "\U0001f3af <b>\u0411\u044b\u0441\u0442\u0440\u044b\u0435 \u043a\u043e\u043c\u0430\u043d\u0434\u044b</b>\n\n"
+            msg += "\u0414\u043e\u0431\u0430\u0432\u044c\u0442\u0435 \u043a\u043e\u043c\u0430\u043d\u0434\u044b \u043d\u0430 \u0440\u0430\u0431\u043e\u0447\u0438\u0439 \u0441\u0442\u043e\u043b iOS/Android:\n\n"
+            for s in shortcuts:
+                msg += f"{s['icon']} <b>{s['name']}</b> \u2014 {s['description']}\n"
+            msg += f"\n\U0001f511 <b>\u0412\u0430\u0448 API \u0442\u043e\u043a\u0435\u043d:</b>\n<code>{token}</code>\n\n"
+            msg += f"\U0001f310 <b>API URL:</b>\n<code>https://bot.nodkeys.com/api/shortcut</code>\n\n"
+            msg += "\U0001f4f1 \u041d\u0430\u043f\u0438\u0448\u0438\u0442\u0435 <code>/shortcut \u043d\u0430\u0437\u0432\u0430\u043d\u0438\u0435</code> \u0434\u043b\u044f \u0438\u043d\u0441\u0442\u0440\u0443\u043a\u0446\u0438\u0439 \u043f\u043e \u043d\u0430\u0441\u0442\u0440\u043e\u0439\u043a\u0435"
+            await update.message.reply_text(msg, parse_mode="HTML")
+        app.add_handler(CommandHandler("shortcuts", cmd_shortcuts))
+        logger.info("v10.0 modules registered: settings, subscribe, shortcuts")
 
     # Kindle handlers
     try:
