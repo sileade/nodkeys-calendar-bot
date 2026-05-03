@@ -4111,21 +4111,22 @@ def _make_player_keyboard(info_hash: str, track_idx: int, total_tracks: int, web
     # Prev button
     if track_idx > 0:
         buttons_row.append(InlineKeyboardButton(
-            "⏮", callback_data=f"abook:prev:{info_hash}:{track_idx}"
+            "\u23ee", callback_data=f"abook:prev:{info_hash}:{track_idx}"
         ))
     # Play button
     buttons_row.append(InlineKeyboardButton(
-        f"▶️ {track_idx + 1}/{total_tracks}",
+        f"\u25b6\ufe0f {track_idx + 1}/{total_tracks}",
         callback_data=f"abook:play:{info_hash}:{track_idx}"
     ))
     # Next button
     if track_idx < total_tracks - 1:
         buttons_row.append(InlineKeyboardButton(
-            "⏭", callback_data=f"abook:next:{info_hash}:{track_idx}"
+            "\u23ed", callback_data=f"abook:next:{info_hash}:{track_idx}"
         ))
     return InlineKeyboardMarkup([
         buttons_row,
-        [InlineKeyboardButton("🎧 Открыть плеер", url=webapp_url)],
+        [InlineKeyboardButton("\U0001f4e5 \u0421\u043a\u0430\u0447\u0430\u0442\u044c \u043e\u0434\u043d\u0438\u043c \u0444\u0430\u0439\u043b\u043e\u043c", callback_data=f"abook:merge:{info_hash}")],
+        [InlineKeyboardButton("\U0001f3a7 \u041e\u0442\u043a\u0440\u044b\u0442\u044c \u043f\u043b\u0435\u0435\u0440", url=webapp_url)],
     ])
 
 
@@ -4210,6 +4211,105 @@ async def callback_audiobook(update: Update, context: ContextTypes.DEFAULT_TYPE)
         except Exception as e:
             logger.error("abook:play error: %s", e)
             await query.answer(f"❌ Ошибка: {str(e)[:100]}", show_alert=True)
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        return
+
+    # ── Merge & send as one file: abook:merge:{hash} ──
+    if data.startswith("abook:merge:"):
+        await query.answer("\u23f3 \u041e\u0431\u044a\u0435\u0434\u0438\u043d\u044f\u044e \u0444\u0430\u0439\u043b\u044b...")
+        info_hash = data.split(":")[2]
+        cache = _load_audiobook_cache()
+        book = cache.get(info_hash)
+        if not book or not book.get('files'):
+            await query.answer("\u274c \u041a\u043d\u0438\u0433\u0430 \u043d\u0435 \u043d\u0430\u0439\u0434\u0435\u043d\u0430", show_alert=True)
+            return
+        files = book['files']
+        title = book.get('title', '\u0410\u0443\u0434\u0438\u043e\u043a\u043d\u0438\u0433\u0430')
+        import tempfile
+        import shutil
+        import subprocess
+        tmp_dir = tempfile.mkdtemp(prefix='abook_merge_')
+        try:
+            # Update message to show progress
+            try:
+                await query.edit_message_text(
+                    f"\u23f3 \u041e\u0431\u044a\u0435\u0434\u0438\u043d\u044f\u044e {len(files)} \u0444\u0430\u0439\u043b\u043e\u0432 \u0432 \u043e\u0434\u0438\u043d...\n"
+                    f"\U0001f3a7 {title}\n"
+                    f"\u2139\ufe0f \u042d\u0442\u043e \u043c\u043e\u0436\u0435\u0442 \u0437\u0430\u043d\u044f\u0442\u044c \u043d\u0435\u0441\u043a\u043e\u043b\u044c\u043a\u043e \u043c\u0438\u043d\u0443\u0442"
+                )
+            except Exception:
+                pass
+            # Download all files from S3
+            file_list_path = os.path.join(tmp_dir, 'filelist.txt')
+            downloaded = []
+            for i, f in enumerate(files):
+                s3_key = f.get('key', '')
+                filename = f.get('filename', f'track_{i}.mp3')
+                local_path = os.path.join(tmp_dir, f'{i:04d}_{filename}')
+                ok = await asyncio.to_thread(_download_from_s3, s3_key, local_path)
+                if ok:
+                    downloaded.append(local_path)
+            if not downloaded:
+                await context.bot.send_message(
+                    chat_id=query.message.chat_id,
+                    text="\u274c \u041d\u0435 \u0443\u0434\u0430\u043b\u043e\u0441\u044c \u0441\u043a\u0430\u0447\u0430\u0442\u044c \u0444\u0430\u0439\u043b\u044b"
+                )
+                return
+            # Create ffmpeg concat file
+            with open(file_list_path, 'w') as fl:
+                for p in downloaded:
+                    fl.write(f"file '{p}'\n")
+            # Merge with ffmpeg
+            safe_title = title.replace('/', '_').replace('\\', '_')[:60]
+            output_path = os.path.join(tmp_dir, f'{safe_title}.mp3')
+            cmd = ['ffmpeg', '-y', '-f', 'concat', '-safe', '0', '-i', file_list_path, '-c', 'copy', output_path]
+            result = await asyncio.to_thread(
+                subprocess.run, cmd, capture_output=True, timeout=600
+            )
+            if result.returncode != 0 or not os.path.exists(output_path):
+                logger.error("ffmpeg merge failed: %s", result.stderr[:500] if result.stderr else 'unknown')
+                await context.bot.send_message(
+                    chat_id=query.message.chat_id,
+                    text="\u274c \u041e\u0448\u0438\u0431\u043a\u0430 \u043e\u0431\u044a\u0435\u0434\u0438\u043d\u0435\u043d\u0438\u044f \u0444\u0430\u0439\u043b\u043e\u0432"
+                )
+                return
+            # Check file size
+            file_size = os.path.getsize(output_path)
+            if file_size > 2 * 1024 * 1024 * 1024:  # 2 GB limit
+                await context.bot.send_message(
+                    chat_id=query.message.chat_id,
+                    text="\u274c \u0424\u0430\u0439\u043b \u0441\u043b\u0438\u0448\u043a\u043e\u043c \u0431\u043e\u043b\u044c\u0448\u043e\u0439 (>2 GB). \u0418\u0441\u043f\u043e\u043b\u044c\u0437\u0443\u0439\u0442\u0435 \u043f\u043b\u0435\u0435\u0440."
+                )
+                return
+            # Send as document
+            size_mb = file_size / (1024 * 1024)
+            with open(output_path, 'rb') as merged_file:
+                await context.bot.send_document(
+                    chat_id=query.message.chat_id,
+                    document=merged_file,
+                    filename=f'{safe_title}.mp3',
+                    caption=f"\U0001f3a7 {title}\n\U0001f4be {size_mb:.0f} MB | {len(files)} \u0433\u043b\u0430\u0432 \u0432 \u043e\u0434\u043d\u043e\u043c \u0444\u0430\u0439\u043b\u0435",
+                )
+            # Restore original message
+            webapp_url = f"https://bot.nodkeys.com/audiobook/player?hash={info_hash}"
+            kb = _make_player_keyboard(info_hash, 0, len(files), webapp_url)
+            try:
+                await query.edit_message_text(
+                    f"\u2705 \u0410\u0443\u0434\u0438\u043e\u043a\u043d\u0438\u0433\u0430 \u0433\u043e\u0442\u043e\u0432\u0430!\n\n"
+                    f"\U0001f3a7 {title}\n"
+                    f"\U0001f4c4 {len(files)} \u0430\u0443\u0434\u0438\u043e\u0444\u0430\u0439\u043b\u043e\u0432\n\n"
+                    f"\u25b6\ufe0f \u041d\u0430\u0436\u043c\u0438\u0442\u0435 Play \u0434\u043b\u044f \u043f\u0440\u043e\u0441\u043b\u0443\u0448\u0438\u0432\u0430\u043d\u0438\u044f \u0432 \u0447\u0430\u0442\u0435",
+                    reply_markup=kb,
+                )
+            except Exception:
+                pass
+        except Exception as e:
+            logger.error("abook:merge error: %s", e)
+            await context.bot.send_message(
+                chat_id=query.message.chat_id,
+                text=f"\u274c \u041e\u0448\u0438\u0431\u043a\u0430: {str(e)[:100]}"
+            )
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
         return
