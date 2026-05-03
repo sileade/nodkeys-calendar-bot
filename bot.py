@@ -1289,28 +1289,18 @@ async def audiobook_download_pipeline(
             total_size = sum(f['size'] for f in cached_files)
         except Exception as e:
             logger.error("Cache size calc error: %s, files sample: %s", e, cached_files[:2])
-        # Use URL buttons (WebApp buttons don't work in group chats)
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton(
-                "\U0001f3a7 Открыть плеер",
-                url=webapp_url,
-            )],
-            [InlineKeyboardButton(
-                "\U0001f4e5 Скачать все файлы",
-                url=download_url,
-            )],
-        ])
+        # Player keyboard with play/prev/next + full player link
+        keyboard = _make_player_keyboard(info_hash, 0, len(cached_files), webapp_url)
         try:
             await _edit(
                 f"\u2705 <b>Аудиокнига готова!</b>\n\n"
                 f"\U0001f3a7 {title[:60]}\n"
                 f"\U0001f4c1 {len(cached_files)} аудиофайлов ({_format_size(total_size)})\n\n"
-                f"\U0001f4a1 Нажмите <b>\"Открыть плеер\"</b> для прослушивания.",
+                f"\u25b6\ufe0f Нажмите Play для прослушивания в чате",
                 reply_markup=keyboard,
             )
         except Exception as e:
             logger.error("Failed to send player button (cache): %s", e)
-            # Fallback: send as new message
             try:
                 await bot.send_message(
                     chat_id=chat_id,
@@ -1318,7 +1308,7 @@ async def audiobook_download_pipeline(
                         f"\u2705 <b>Аудиокнига готова!</b>\n\n"
                         f"\U0001f3a7 {title[:60]}\n"
                         f"\U0001f4c1 {len(cached_files)} аудиофайлов ({_format_size(total_size)})\n\n"
-                        f"\U0001f4a1 Нажмите <b>\"Открыть плеер\"</b> для прослушивания."
+                        f"\u25b6\ufe0f Нажмите Play для прослушивания в чате"
                     ),
                     parse_mode="HTML",
                     reply_markup=keyboard,
@@ -1468,28 +1458,18 @@ async def audiobook_download_pipeline(
     webapp_url = f"https://bot.nodkeys.com/audiobook/player?hash={info_hash}"
     download_url = f"https://bot.nodkeys.com/audiobook/download/{info_hash}"
     total_uploaded_size = sum(f['size'] for f in uploaded)
-    # Use URL buttons (WebApp buttons don't work in group chats)
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton(
-            "\U0001f3a7 Открыть плеер",
-            url=webapp_url,
-        )],
-        [InlineKeyboardButton(
-            "\U0001f4e5 Скачать все файлы",
-            url=download_url,
-        )],
-    ])
+    # Player keyboard with play/prev/next + full player link
+    keyboard = _make_player_keyboard(info_hash, 0, len(uploaded), webapp_url)
     try:
         await _edit(
             f"\u2705 <b>Аудиокнига готова!</b>\n\n"
             f"\U0001f3a7 {title[:60]}\n"
             f"\U0001f4c1 {len(uploaded)} файлов ({_format_size(total_uploaded_size)})\n\n"
-            f"\U0001f4a1 Нажмите <b>\"Открыть плеер\"</b> для прослушивания.",
+            f"\u25b6\ufe0f Нажмите Play для прослушивания в чате",
             reply_markup=keyboard,
         )
     except Exception as e:
         logger.error("Step 5: Failed to send player button: %s", e)
-        # Fallback: send as new message
         try:
             await bot.send_message(
                 chat_id=chat_id,
@@ -1497,7 +1477,7 @@ async def audiobook_download_pipeline(
                     f"\u2705 <b>Аудиокнига готова!</b>\n\n"
                     f"\U0001f3a7 {title[:60]}\n"
                     f"\U0001f4c1 {len(uploaded)} файлов ({_format_size(total_uploaded_size)})\n\n"
-                    f"\U0001f4a1 Нажмите <b>\"Открыть плеер\"</b> для прослушивания."
+                    f"\u25b6\ufe0f Нажмите Play для прослушивания в чате"
                 ),
                 parse_mode="HTML",
                 reply_markup=keyboard,
@@ -4125,12 +4105,129 @@ async def cmd_book(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+def _make_player_keyboard(info_hash: str, track_idx: int, total_tracks: int, webapp_url: str) -> InlineKeyboardMarkup:
+    """Create inline keyboard with play/prev/next buttons for audiobook player."""
+    buttons_row = []
+    # Prev button
+    if track_idx > 0:
+        buttons_row.append(InlineKeyboardButton(
+            "⏮", callback_data=f"abook:prev:{info_hash}:{track_idx}"
+        ))
+    # Play button
+    buttons_row.append(InlineKeyboardButton(
+        f"▶️ {track_idx + 1}/{total_tracks}",
+        callback_data=f"abook:play:{info_hash}:{track_idx}"
+    ))
+    # Next button
+    if track_idx < total_tracks - 1:
+        buttons_row.append(InlineKeyboardButton(
+            "⏭", callback_data=f"abook:next:{info_hash}:{track_idx}"
+        ))
+    return InlineKeyboardMarkup([
+        buttons_row,
+        [InlineKeyboardButton("🎧 Открыть плеер", url=webapp_url)],
+    ])
+
+
 async def callback_audiobook(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle audiobook selection callback — download and send audio files."""
     query = update.callback_query
+    data = query.data
+
+    # ── Play track: abook:play:{hash}:{idx} ──
+    if data.startswith("abook:play:"):
+        await query.answer("⏳ Отправляю аудио...")
+        parts = data.split(":")
+        info_hash = parts[2]
+        track_idx = int(parts[3])
+        cache = _load_audiobook_cache()
+        book = cache.get(info_hash)
+        if not book or not book.get('files'):
+            await query.answer("❌ Книга не найдена в кэше", show_alert=True)
+            return
+        files = book['files']
+        if track_idx >= len(files):
+            track_idx = 0
+        f = files[track_idx]
+        s3_key = f.get('key', '')
+        filename = f.get('filename', f'track_{track_idx}.mp3')
+        title = book.get('title', 'Аудиокнига')
+        # Download from S3 to temp file
+        import tempfile
+        tmp_dir = tempfile.mkdtemp(prefix='abook_')
+        local_path = os.path.join(tmp_dir, filename)
+        try:
+            ok = await asyncio.to_thread(_download_from_s3, s3_key, local_path)
+            if not ok:
+                await query.answer("❌ Не удалось скачать файл из S3", show_alert=True)
+                return
+            # Send audio to chat
+            with open(local_path, 'rb') as audio_file:
+                await context.bot.send_audio(
+                    chat_id=query.message.chat_id,
+                    audio=audio_file,
+                    title=f"{filename}",
+                    performer=title[:40],
+                    caption=f"🎧 {title[:50]}\n📄 {filename} ({track_idx + 1}/{len(files)})",
+                )
+            # Update keyboard to next track
+            next_idx = min(track_idx + 1, len(files) - 1)
+            webapp_url = f"https://bot.nodkeys.com/audiobook/player?hash={info_hash}"
+            new_kb = _make_player_keyboard(info_hash, next_idx, len(files), webapp_url)
+            try:
+                await query.edit_message_reply_markup(reply_markup=new_kb)
+            except Exception:
+                pass
+        except Exception as e:
+            logger.error("abook:play error: %s", e)
+            await query.answer(f"❌ Ошибка: {str(e)[:100]}", show_alert=True)
+        finally:
+            import shutil
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        return
+
+    # ── Next track: abook:next:{hash}:{idx} ──
+    if data.startswith("abook:next:"):
+        await query.answer()
+        parts = data.split(":")
+        info_hash = parts[2]
+        track_idx = int(parts[3])
+        cache = _load_audiobook_cache()
+        book = cache.get(info_hash)
+        if not book:
+            return
+        files = book.get('files', [])
+        next_idx = min(track_idx + 1, len(files) - 1)
+        webapp_url = f"https://bot.nodkeys.com/audiobook/player?hash={info_hash}"
+        new_kb = _make_player_keyboard(info_hash, next_idx, len(files), webapp_url)
+        try:
+            await query.edit_message_reply_markup(reply_markup=new_kb)
+        except Exception:
+            pass
+        return
+
+    # ── Prev track: abook:prev:{hash}:{idx} ──
+    if data.startswith("abook:prev:"):
+        await query.answer()
+        parts = data.split(":")
+        info_hash = parts[2]
+        track_idx = int(parts[3])
+        cache = _load_audiobook_cache()
+        book = cache.get(info_hash)
+        if not book:
+            return
+        files = book.get('files', [])
+        prev_idx = max(track_idx - 1, 0)
+        webapp_url = f"https://bot.nodkeys.com/audiobook/player?hash={info_hash}"
+        new_kb = _make_player_keyboard(info_hash, prev_idx, len(files), webapp_url)
+        try:
+            await query.edit_message_reply_markup(reply_markup=new_kb)
+        except Exception:
+            pass
+        return
+
     await query.answer()
 
-    data = query.data
     if data == "abook:cancel":
         await query.edit_message_text("❌ Поиск отменён")
         context.user_data.pop("audiobook_search_results", None)
