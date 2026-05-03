@@ -4137,80 +4137,73 @@ async def callback_audiobook(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     # ── Play track: abook:play:{hash}:{idx} ──
     if data.startswith("abook:play:"):
-        await query.answer("⏳ Отправляю аудио...")
+        await query.answer("\u23f3 \u0417\u0430\u0433\u0440\u0443\u0436\u0430\u044e 10 \u0433\u043b\u0430\u0432...")
         parts = data.split(":")
         info_hash = parts[2]
         track_idx = int(parts[3])
         cache = _load_audiobook_cache()
         book = cache.get(info_hash)
         if not book or not book.get('files'):
-            await query.answer("❌ Книга не найдена в кэше", show_alert=True)
+            await query.answer("\u274c \u041a\u043d\u0438\u0433\u0430 \u043d\u0435 \u043d\u0430\u0439\u0434\u0435\u043d\u0430 \u0432 \u043a\u044d\u0448\u0435", show_alert=True)
             return
         files = book['files']
         if track_idx >= len(files):
             track_idx = 0
-        title = book.get('title', 'Аудиокнига')
+        title = book.get('title', '\u0410\u0443\u0434\u0438\u043e\u043a\u043d\u0438\u0433\u0430')
         import tempfile
         import shutil
         tmp_dir = tempfile.mkdtemp(prefix='abook_')
+        BATCH_SIZE = 10
         try:
-            # Send current track
-            f = files[track_idx]
-            s3_key = f.get('key', '')
-            filename = f.get('filename', f'track_{track_idx}.mp3')
-            local_path = os.path.join(tmp_dir, filename)
-            ok = await asyncio.to_thread(_download_from_s3, s3_key, local_path)
-            if not ok:
-                await query.answer("❌ Не удалось скачать файл из S3", show_alert=True)
-                return
-            # Build inline keyboard with "Next chapter" button under the audio message
-            next_idx = track_idx + 1
-            if next_idx < len(files):
-                next_kb = InlineKeyboardMarkup([
-                    [InlineKeyboardButton(f"\u23ed\ufe0f \u0421\u043b\u0435\u0434\u0443\u044e\u0449\u0430\u044f \u0433\u043b\u0430\u0432\u0430 ({next_idx + 1}/{len(files)})", callback_data=f"abook:play:{info_hash}:{next_idx}")]
-                ])
-            else:
-                next_kb = InlineKeyboardMarkup([
-                    [InlineKeyboardButton("\u2705 \u041a\u043d\u0438\u0433\u0430 \u0437\u0430\u0432\u0435\u0440\u0448\u0435\u043d\u0430", callback_data=f"abook:done:{info_hash}")]
-                ])
-            with open(local_path, 'rb') as audio_file:
-                await context.bot.send_audio(
-                    chat_id=query.message.chat_id,
-                    audio=audio_file,
-                    title=f"{filename}",
-                    performer=title[:40],
-                    caption=f"\U0001f3a7 {title[:50]}\n\U0001f4c4 {filename} ({track_idx + 1}/{len(files)})",
-                    reply_markup=next_kb,
-                )
-            # Auto-send next chapter immediately
-            if next_idx < len(files):
-                f2 = files[next_idx]
-                s3_key2 = f2.get('key', '')
-                filename2 = f2.get('filename', f'track_{next_idx}.mp3')
-                local_path2 = os.path.join(tmp_dir, filename2)
-                ok2 = await asyncio.to_thread(_download_from_s3, s3_key2, local_path2)
-                if ok2:
-                    next_idx2 = next_idx + 1
-                    if next_idx2 < len(files):
-                        next_kb2 = InlineKeyboardMarkup([
-                            [InlineKeyboardButton(f"\u23ed\ufe0f \u0421\u043b\u0435\u0434\u0443\u044e\u0449\u0430\u044f \u0433\u043b\u0430\u0432\u0430 ({next_idx2 + 1}/{len(files)})", callback_data=f"abook:play:{info_hash}:{next_idx2}")]
-                        ])
-                    else:
-                        next_kb2 = InlineKeyboardMarkup([
-                            [InlineKeyboardButton("\u2705 \u041a\u043d\u0438\u0433\u0430 \u0437\u0430\u0432\u0435\u0440\u0448\u0435\u043d\u0430", callback_data=f"abook:done:{info_hash}")]
-                        ])
-                    with open(local_path2, 'rb') as audio_file2:
-                        await context.bot.send_audio(
-                            chat_id=query.message.chat_id,
-                            audio=audio_file2,
-                            title=f"{filename2}",
-                            performer=title[:40],
-                            caption=f"\U0001f3a7 {title[:50]}\n\U0001f4c4 {filename2} ({next_idx + 1}/{len(files)})",
-                            reply_markup=next_kb2,
-                        )
+            # Send up to BATCH_SIZE tracks starting from track_idx
+            end_idx = min(track_idx + BATCH_SIZE, len(files))
+            for i in range(track_idx, end_idx):
+                f = files[i]
+                s3_key = f.get('key', '')
+                filename = f.get('filename', f'track_{i}.mp3')
+                local_path = os.path.join(tmp_dir, filename)
+                ok = await asyncio.to_thread(_download_from_s3, s3_key, local_path)
+                if not ok:
+                    continue
+                # Last track in batch gets "Next 10 chapters" button
+                if i == end_idx - 1 and end_idx < len(files):
+                    next_kb = InlineKeyboardMarkup([
+                        [InlineKeyboardButton(
+                            f"\u23ed\ufe0f \u0421\u043b\u0435\u0434\u0443\u044e\u0449\u0438\u0435 10 \u0433\u043b\u0430\u0432 ({end_idx + 1}/{len(files)})",
+                            callback_data=f"abook:play:{info_hash}:{end_idx}"
+                        )]
+                    ])
+                elif i == end_idx - 1:
+                    next_kb = InlineKeyboardMarkup([
+                        [InlineKeyboardButton("\u2705 \u041a\u043d\u0438\u0433\u0430 \u0437\u0430\u0432\u0435\u0440\u0448\u0435\u043d\u0430", callback_data=f"abook:done:{info_hash}")]
+                    ])
+                else:
+                    next_kb = None
+                with open(local_path, 'rb') as audio_file:
+                    await context.bot.send_audio(
+                        chat_id=query.message.chat_id,
+                        audio=audio_file,
+                        title=filename,
+                        performer=title[:40],
+                        caption=f"\U0001f3a7 {title[:50]}\n\U0001f4c4 {filename} ({i + 1}/{len(files)})",
+                        reply_markup=next_kb,
+                    )
+                # Clean up file after sending
+                try:
+                    os.remove(local_path)
+                except Exception:
+                    pass
+            # Update main message keyboard to reflect new position
+            if end_idx < len(files):
+                webapp_url = f"https://bot.nodkeys.com/audiobook/player?hash={info_hash}"
+                kb = _make_player_keyboard(info_hash, end_idx, len(files), webapp_url)
+                try:
+                    await query.edit_message_reply_markup(reply_markup=kb)
+                except Exception:
+                    pass
         except Exception as e:
             logger.error("abook:play error: %s", e)
-            await query.answer(f"❌ Ошибка: {str(e)[:100]}", show_alert=True)
+            await query.answer(f"\u274c \u041e\u0448\u0438\u0431\u043a\u0430: {str(e)[:100]}", show_alert=True)
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
         return
