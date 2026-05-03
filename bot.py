@@ -4178,7 +4178,7 @@ async def callback_audiobook(update: Update, context: ContextTypes.DEFAULT_TYPE)
                     audio=audio_file,
                     title=f"{filename}",
                     performer=title[:40],
-                    caption=f"\ud83c\udfa7 {title[:50]}\n\ud83d\udcc4 {filename} ({track_idx + 1}/{len(files)})",
+                    caption=f"\U0001f3a7 {title[:50]}\n\U0001f4c4 {filename} ({track_idx + 1}/{len(files)})",
                     reply_markup=next_kb,
                 )
             # Auto-send next chapter immediately
@@ -4204,7 +4204,7 @@ async def callback_audiobook(update: Update, context: ContextTypes.DEFAULT_TYPE)
                             audio=audio_file2,
                             title=f"{filename2}",
                             performer=title[:40],
-                            caption=f"\ud83c\udfa7 {title[:50]}\n\ud83d\udcc4 {filename2} ({next_idx + 1}/{len(files)})",
+                            caption=f"\U0001f3a7 {title[:50]}\n\U0001f4c4 {filename2} ({next_idx + 1}/{len(files)})",
                             reply_markup=next_kb2,
                         )
         except Exception as e:
