@@ -4148,20 +4148,20 @@ async def callback_audiobook(update: Update, context: ContextTypes.DEFAULT_TYPE)
         files = book['files']
         if track_idx >= len(files):
             track_idx = 0
-        f = files[track_idx]
-        s3_key = f.get('key', '')
-        filename = f.get('filename', f'track_{track_idx}.mp3')
         title = book.get('title', 'Аудиокнига')
-        # Download from S3 to temp file
         import tempfile
+        import shutil
         tmp_dir = tempfile.mkdtemp(prefix='abook_')
-        local_path = os.path.join(tmp_dir, filename)
         try:
+            # Send current track
+            f = files[track_idx]
+            s3_key = f.get('key', '')
+            filename = f.get('filename', f'track_{track_idx}.mp3')
+            local_path = os.path.join(tmp_dir, filename)
             ok = await asyncio.to_thread(_download_from_s3, s3_key, local_path)
             if not ok:
                 await query.answer("❌ Не удалось скачать файл из S3", show_alert=True)
                 return
-            # Send audio to chat
             with open(local_path, 'rb') as audio_file:
                 await context.bot.send_audio(
                     chat_id=query.message.chat_id,
@@ -4170,10 +4170,29 @@ async def callback_audiobook(update: Update, context: ContextTypes.DEFAULT_TYPE)
                     performer=title[:40],
                     caption=f"🎧 {title[:50]}\n📄 {filename} ({track_idx + 1}/{len(files)})",
                 )
-            # Update keyboard to next track
-            next_idx = min(track_idx + 1, len(files) - 1)
+            # Auto-preload next track
+            next_idx = track_idx + 1
+            if next_idx < len(files):
+                f2 = files[next_idx]
+                s3_key2 = f2.get('key', '')
+                filename2 = f2.get('filename', f'track_{next_idx}.mp3')
+                local_path2 = os.path.join(tmp_dir, filename2)
+                ok2 = await asyncio.to_thread(_download_from_s3, s3_key2, local_path2)
+                if ok2:
+                    with open(local_path2, 'rb') as audio_file2:
+                        await context.bot.send_audio(
+                            chat_id=query.message.chat_id,
+                            audio=audio_file2,
+                            title=f"{filename2}",
+                            performer=title[:40],
+                            caption=f"🎧 {title[:50]}\n📄 {filename2} ({next_idx + 1}/{len(files)})",
+                        )
+                # Update keyboard to track after next (idx+2)
+                kb_idx = min(next_idx + 1, len(files) - 1)
+            else:
+                kb_idx = track_idx  # last track, stay
             webapp_url = f"https://bot.nodkeys.com/audiobook/player?hash={info_hash}"
-            new_kb = _make_player_keyboard(info_hash, next_idx, len(files), webapp_url)
+            new_kb = _make_player_keyboard(info_hash, kb_idx, len(files), webapp_url)
             try:
                 await query.edit_message_reply_markup(reply_markup=new_kb)
             except Exception:
@@ -4182,7 +4201,6 @@ async def callback_audiobook(update: Update, context: ContextTypes.DEFAULT_TYPE)
             logger.error("abook:play error: %s", e)
             await query.answer(f"❌ Ошибка: {str(e)[:100]}", show_alert=True)
         finally:
-            import shutil
             shutil.rmtree(tmp_dir, ignore_errors=True)
         return
 
