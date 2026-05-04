@@ -15,7 +15,7 @@ Telegram bot that analyzes messages using Claude AI and routes them:
 - All through natural language — no commands needed
 """
 
-VERSION = "10.0"
+VERSION = "10.1"
 
 import os
 import re
@@ -66,6 +66,57 @@ except ImportError as _import_err:
     import traceback as _tb
     _tb.print_exc()
     NEW_MODULES_LOADED = False
+
+# --- v10.1 Commercial modules ---
+try:
+    from smart_reminders import (
+        analyze_content_for_reminders, process_photo_for_reminders,
+        process_message_for_reminders, generate_proactive_suggestions,
+        add_suggestion, accept_suggestion, dismiss_suggestion,
+        get_pending_suggestions, format_suggestion_message
+    )
+    from library import (
+        add_book, add_audiobook, update_book_progress, update_audiobook_progress,
+        rate_book, add_book_note, get_goal_progress, get_reading_stats,
+        get_recommendations, format_library_message, format_book_list,
+        format_book_detail, format_stats_message, set_reading_goal
+    )
+    from diary import (
+        create_entry as diary_create_entry, get_today_entry, get_entries as diary_get_entries,
+        get_evening_prompt, get_mood_stats, get_diary_insights,
+        format_diary_overview, format_mood_report, get_diary_settings, update_diary_settings
+    )
+    from family import (
+        create_family, invite_member, remove_member, get_members,
+        is_family_member, create_list as family_create_list,
+        add_list_item, check_list_item, get_lists as family_get_lists,
+        assign_task as family_assign_task, complete_task as family_complete_task,
+        get_family_tasks, add_family_event, get_upcoming_family_events,
+        format_family_overview, format_list_message as family_format_list
+    )
+    from yearly_review import cmd_yearly_review
+    from voice_assistant import (
+        text_to_speech, speech_to_text, should_send_as_voice,
+        clean_text_for_tts, generate_voice_briefing, get_voice_settings,
+        save_voice_settings, format_voice_settings_message, cleanup_voice_cache
+    )
+    from podcasts import (
+        search_podcasts, get_podcast_episodes, subscribe_podcast,
+        unsubscribe_podcast, get_subscriptions as podcast_get_subscriptions,
+        add_to_queue as podcast_add_to_queue, get_queue as podcast_get_queue,
+        check_new_episodes, download_episode, format_search_results as podcast_format_results,
+        format_podcast_detail, format_subscriptions_message as podcast_format_subs
+    )
+    from notion_sync import (
+        verify_notion_connection, list_notion_databases, run_full_sync,
+        export_diary_to_obsidian, export_books_to_obsidian,
+        format_sync_settings, format_sync_result
+    )
+    V101_MODULES_LOADED = True
+except ImportError as _v101_err:
+    import traceback as _tb101
+    _tb101.print_exc()
+    V101_MODULES_LOADED = False
 
 # ──────────────────── Configuration ────────────────────
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
@@ -9130,6 +9181,288 @@ def main():
             await update.message.reply_text(msg, parse_mode="HTML")
         app.add_handler(CommandHandler("shortcuts", cmd_shortcuts))
         logger.info("v10.0 modules registered: settings, subscribe, shortcuts")
+
+    # --- v10.1: Commercial modules handlers ---
+    if V101_MODULES_LOADED:
+        # Library commands
+        async def cmd_library(update: Update, context: ContextTypes.DEFAULT_TYPE):
+            msg, buttons = format_library_message()
+            kb = [[InlineKeyboardButton(b["text"], callback_data=b["callback_data"]) for b in row] for row in buttons] if buttons else []
+            await update.message.reply_text(msg, parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup(kb) if kb else None)
+
+        async def callback_library(update: Update, context: ContextTypes.DEFAULT_TYPE):
+            query = update.callback_query
+            await query.answer()
+            data = query.data
+            if data == "lib:stats":
+                msg = format_stats_message()
+                await query.edit_message_text(msg, parse_mode="HTML")
+            elif data == "lib:goal":
+                context.user_data["awaiting"] = "lib_goal"
+                await query.edit_message_text("📚 Введите цель на год (количество книг):")
+            elif data.startswith("lib:rate:"):
+                book_id = data.split(":")[2]
+                context.user_data["awaiting"] = f"lib_rate:{book_id}"
+                await query.edit_message_text("⭐ Оцените книгу от 1 до 5:")
+            elif data.startswith("lib:note:"):
+                book_id = data.split(":")[2]
+                context.user_data["awaiting"] = f"lib_note:{book_id}"
+                await query.edit_message_text("📝 Введите заметку к книге:")
+            elif data.startswith("lib:progress:"):
+                book_id = data.split(":")[2]
+                context.user_data["awaiting"] = f"lib_progress:{book_id}"
+                await query.edit_message_text("📖 Введите текущую страницу или процент (например: 150 или 75%):")
+            else:
+                msg, buttons = format_library_message()
+                kb = [[InlineKeyboardButton(b["text"], callback_data=b["callback_data"]) for b in row] for row in buttons] if buttons else []
+                await query.edit_message_text(msg, parse_mode="HTML",
+                    reply_markup=InlineKeyboardMarkup(kb) if kb else None)
+
+        # Diary commands
+        async def cmd_diary(update: Update, context: ContextTypes.DEFAULT_TYPE):
+            msg, buttons = format_diary_overview()
+            kb = [[InlineKeyboardButton(b["text"], callback_data=b["callback_data"]) for b in row] for row in buttons] if buttons else []
+            await update.message.reply_text(msg, parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup(kb) if kb else None)
+
+        async def callback_diary(update: Update, context: ContextTypes.DEFAULT_TYPE):
+            query = update.callback_query
+            await query.answer()
+            data = query.data
+            if data == "diary:write":
+                context.user_data["awaiting"] = "diary_entry"
+                prompt = get_evening_prompt()
+                await query.edit_message_text(f"🌙 <b>Дневник</b>\n\n{prompt}\n\nНапишите свои мысли:", parse_mode="HTML")
+            elif data == "diary:mood":
+                kb = [[InlineKeyboardButton(f"{e} {i}", callback_data=f"diary:mood:{i}") for i, e in [(1,"😞"),(2,"😔"),(3,"😐"),(4,"🙂"),(5,"😊")]]]
+                await query.edit_message_text("Как ваше настроение сегодня?",
+                    reply_markup=InlineKeyboardMarkup(kb))
+            elif data.startswith("diary:mood:"):
+                mood = int(data.split(":")[2])
+                entry = get_today_entry()
+                if entry:
+                    entry["mood"] = mood
+                else:
+                    diary_create_entry(mood=mood)
+                mood_emojis = {5: "😊", 4: "🙂", 3: "😐", 2: "😔", 1: "😞"}
+                await query.edit_message_text(f"{mood_emojis[mood]} Настроение записано!")
+            elif data == "diary:stats":
+                msg = format_mood_report()
+                await query.edit_message_text(msg, parse_mode="HTML")
+            else:
+                msg, buttons = format_diary_overview()
+                kb = [[InlineKeyboardButton(b["text"], callback_data=b["callback_data"]) for b in row] for row in buttons] if buttons else []
+                await query.edit_message_text(msg, parse_mode="HTML",
+                    reply_markup=InlineKeyboardMarkup(kb) if kb else None)
+
+        # Family commands
+        async def cmd_family(update: Update, context: ContextTypes.DEFAULT_TYPE):
+            user_id = update.effective_user.id
+            msg, buttons = format_family_overview(user_id)
+            kb = [[InlineKeyboardButton(b["text"], callback_data=b["callback_data"]) for b in row] for row in buttons] if buttons else []
+            await update.message.reply_text(msg, parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup(kb) if kb else None)
+
+        async def callback_family(update: Update, context: ContextTypes.DEFAULT_TYPE):
+            query = update.callback_query
+            await query.answer()
+            data = query.data
+            user_id = update.effective_user.id
+            if data == "fam:create":
+                name = update.effective_user.first_name or "User"
+                create_family(user_id, f"Семья {name}")
+                msg, buttons = format_family_overview(user_id)
+                kb = [[InlineKeyboardButton(b["text"], callback_data=b["callback_data"]) for b in row] for row in buttons] if buttons else []
+                await query.edit_message_text(msg, parse_mode="HTML",
+                    reply_markup=InlineKeyboardMarkup(kb) if kb else None)
+            elif data == "fam:invite":
+                context.user_data["awaiting"] = "fam_invite"
+                await query.edit_message_text("👥 Перешлите сообщение от пользователя, которого хотите добавить, или введите его @username:")
+            elif data == "fam:list:new":
+                context.user_data["awaiting"] = "fam_list_name"
+                await query.edit_message_text("📋 Введите название нового списка:")
+            elif data.startswith("fam:list:"):
+                list_id = data.split(":")[2]
+                msg = family_format_list(list_id)
+                await query.edit_message_text(msg, parse_mode="HTML")
+            elif data == "fam:tasks":
+                tasks = get_family_tasks(user_id)
+                if tasks:
+                    msg = "✅ <b>Семейные задачи:</b>\n\n"
+                    for t in tasks[:10]:
+                        status = "✅" if t.get("completed") else "⬜"
+                        msg += f"{status} {t['title']} (@{t.get('assigned_to', '?')})\n"
+                else:
+                    msg = "Нет семейных задач."
+                await query.edit_message_text(msg, parse_mode="HTML")
+
+        # Podcast commands
+        async def cmd_podcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+            args = context.args
+            if args:
+                query_text = " ".join(args)
+                results = await search_podcasts(query_text)
+                msg, buttons = podcast_format_results(results)
+                kb = [[InlineKeyboardButton(b["text"], callback_data=b["callback_data"]) for b in row] for row in buttons] if buttons else []
+                await update.message.reply_text(msg, parse_mode="HTML",
+                    reply_markup=InlineKeyboardMarkup(kb) if kb else None)
+            else:
+                msg, buttons = podcast_format_subs()
+                kb = [[InlineKeyboardButton(b["text"], callback_data=b["callback_data"]) for b in row] for row in buttons] if buttons else []
+                await update.message.reply_text(msg, parse_mode="HTML",
+                    reply_markup=InlineKeyboardMarkup(kb) if kb else None)
+
+        async def callback_podcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+            query = update.callback_query
+            await query.answer()
+            data = query.data
+            if data == "pod:main":
+                msg, buttons = podcast_format_subs()
+                kb = [[InlineKeyboardButton(b["text"], callback_data=b["callback_data"]) for b in row] for row in buttons] if buttons else []
+                await query.edit_message_text(msg, parse_mode="HTML",
+                    reply_markup=InlineKeyboardMarkup(kb) if kb else None)
+            elif data == "pod:search":
+                context.user_data["awaiting"] = "pod_search"
+                await query.edit_message_text("🔍 Введите название подкаста:")
+            elif data == "pod:check_new":
+                new_eps = await check_new_episodes()
+                if new_eps:
+                    msg = "🆕 <b>Новые эпизоды:</b>\n\n"
+                    for ep in new_eps[:5]:
+                        msg += f"📻 {ep['podcast']}: {ep['episode']['title']}\n"
+                else:
+                    msg = "Нет новых эпизодов."
+                await query.edit_message_text(msg, parse_mode="HTML")
+            elif data.startswith("pod:sub:"):
+                pod_id = data.split(":")[2]
+                # Store podcast_id for subscription
+                context.user_data["pod_subscribe"] = pod_id
+                await query.edit_message_text("✅ Подписка оформлена!")
+            elif data.startswith("pod:unsub:"):
+                pod_id = data.split(":")[2]
+                unsubscribe_podcast(pod_id)
+                await query.edit_message_text("❌ Подписка отменена.")
+
+        # Voice settings command
+        async def cmd_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+            msg, buttons = format_voice_settings_message()
+            kb = [[InlineKeyboardButton(b["text"], callback_data=b["callback_data"]) for b in row] for row in buttons] if buttons else []
+            await update.message.reply_text(msg, parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup(kb) if kb else None)
+
+        async def callback_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+            query = update.callback_query
+            await query.answer()
+            data = query.data
+            settings = get_voice_settings()
+            if data.startswith("voice:toggle:"):
+                key = data.split(":")[2]
+                settings[key] = not settings.get(key, False)
+                save_voice_settings(settings)
+                msg, buttons = format_voice_settings_message()
+                kb = [[InlineKeyboardButton(b["text"], callback_data=b["callback_data"]) for b in row] for row in buttons] if buttons else []
+                await query.edit_message_text(msg, parse_mode="HTML",
+                    reply_markup=InlineKeyboardMarkup(kb) if kb else None)
+            elif data == "voice:test":
+                test_text = "Привет! Это тестовое сообщение голосового ассистента Nodkeys."
+                audio_path = await text_to_speech(test_text)
+                if audio_path:
+                    await context.bot.send_voice(chat_id=query.message.chat_id, voice=open(audio_path, 'rb'))
+                else:
+                    await query.edit_message_text("❌ TTS недоступен. Проверьте API ключ.")
+            elif data == "voice:change_voice":
+                voices = ["alloy", "echo", "fable", "onyx", "nova", "shimmer"]
+                current_idx = voices.index(settings.get("voice", "alloy")) if settings.get("voice") in voices else 0
+                next_voice = voices[(current_idx + 1) % len(voices)]
+                settings["voice"] = next_voice
+                save_voice_settings(settings)
+                msg, buttons = format_voice_settings_message()
+                kb = [[InlineKeyboardButton(b["text"], callback_data=b["callback_data"]) for b in row] for row in buttons] if buttons else []
+                await query.edit_message_text(msg, parse_mode="HTML",
+                    reply_markup=InlineKeyboardMarkup(kb) if kb else None)
+            elif data == "voice:speed":
+                speeds = [0.75, 1.0, 1.25, 1.5, 2.0]
+                current_speed = settings.get("speed", 1.0)
+                current_idx = speeds.index(current_speed) if current_speed in speeds else 1
+                next_speed = speeds[(current_idx + 1) % len(speeds)]
+                settings["speed"] = next_speed
+                save_voice_settings(settings)
+                msg, buttons = format_voice_settings_message()
+                kb = [[InlineKeyboardButton(b["text"], callback_data=b["callback_data"]) for b in row] for row in buttons] if buttons else []
+                await query.edit_message_text(msg, parse_mode="HTML",
+                    reply_markup=InlineKeyboardMarkup(kb) if kb else None)
+
+        # Yearly review command
+        async def cmd_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
+            await update.message.reply_text("🎉 Генерирую годовой обзор...")
+            cards = await cmd_yearly_review(ai_call_fn=None)  # TODO: pass AI function
+            for card in cards:
+                await update.message.reply_text(card, parse_mode="HTML")
+                await asyncio.sleep(1)
+
+        # Sync/Notion command
+        async def cmd_sync(update: Update, context: ContextTypes.DEFAULT_TYPE):
+            msg, buttons = format_sync_settings()
+            kb = [[InlineKeyboardButton(b["text"], callback_data=b["callback_data"]) for b in row] for row in buttons] if buttons else []
+            await update.message.reply_text(msg, parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup(kb) if kb else None)
+
+        async def callback_sync(update: Update, context: ContextTypes.DEFAULT_TYPE):
+            query = update.callback_query
+            await query.answer()
+            data = query.data
+            if data == "sync:notion:connect":
+                context.user_data["awaiting"] = "notion_api_key"
+                await query.edit_message_text("🔗 Введите ваш Notion Integration Token:\n\n"
+                    "Создайте интеграцию на https://www.notion.so/my-integrations")
+            elif data == "sync:notion:run":
+                await query.edit_message_text("🔄 Синхронизация...")
+                results = await run_full_sync()
+                msg = format_sync_result(results)
+                await query.edit_message_text(msg, parse_mode="HTML")
+            elif data == "sync:obsidian:export":
+                import tempfile, zipfile
+                export_dir = os.path.join(tempfile.gettempdir(), "obsidian_export")
+                os.makedirs(export_dir, exist_ok=True)
+                diary_file = os.path.join(DATA_DIR, "diary.json")
+                if os.path.exists(diary_file):
+                    with open(diary_file, "r") as f:
+                        diary_data = json.load(f)
+                    export_diary_to_obsidian(diary_data.get("entries", []), os.path.join(export_dir, "diary"))
+                library_file = os.path.join(DATA_DIR, "library.json")
+                if os.path.exists(library_file):
+                    with open(library_file, "r") as f:
+                        lib_data = json.load(f)
+                    export_books_to_obsidian(lib_data.get("books", []), os.path.join(export_dir, "books"))
+                # Create zip
+                zip_path = os.path.join(tempfile.gettempdir(), "nodkeys_obsidian_export.zip")
+                with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+                    for root, dirs, files in os.walk(export_dir):
+                        for file in files:
+                            filepath = os.path.join(root, file)
+                            arcname = os.path.relpath(filepath, export_dir)
+                            zf.write(filepath, arcname)
+                await context.bot.send_document(chat_id=query.message.chat_id,
+                    document=open(zip_path, 'rb'), filename="nodkeys_obsidian_export.zip",
+                    caption="📥 Экспорт для Obsidian")
+
+        # Register all v10.1 command handlers
+        app.add_handler(CommandHandler("library", cmd_library))
+        app.add_handler(CommandHandler("diary", cmd_diary))
+        app.add_handler(CommandHandler("family", cmd_family))
+        app.add_handler(CommandHandler("podcast", cmd_podcast))
+        app.add_handler(CommandHandler("voice", cmd_voice))
+        app.add_handler(CommandHandler("review", cmd_review))
+        app.add_handler(CommandHandler("sync", cmd_sync))
+        # Register callback handlers
+        app.add_handler(CallbackQueryHandler(callback_library, pattern=r"^lib:"))
+        app.add_handler(CallbackQueryHandler(callback_diary, pattern=r"^diary:"))
+        app.add_handler(CallbackQueryHandler(callback_family, pattern=r"^fam:"))
+        app.add_handler(CallbackQueryHandler(callback_podcast, pattern=r"^pod:"))
+        app.add_handler(CallbackQueryHandler(callback_voice, pattern=r"^voice:"))
+        app.add_handler(CallbackQueryHandler(callback_sync, pattern=r"^sync:"))
+        logger.info("v10.1 modules registered: library, diary, family, podcast, voice, review, sync")
 
     # Kindle handlers
     try:
