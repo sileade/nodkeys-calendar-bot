@@ -150,6 +150,7 @@ REMINDER_LIST_DEFAULT = "personal"
 REMINDERS_FILE = "/app/data/reminders.json"
 
 TIMEZONE = ZoneInfo(os.environ.get("TZ", "Europe/Moscow"))
+DATA_DIR = os.environ.get("DATA_DIR", "/app/data")
 
 # ──────────────────── Multi-Chat & Per-User Routing ────────────────────
 # Comma-separated list of allowed chat IDs (personal + group chats)
@@ -9232,8 +9233,8 @@ def main():
             data = query.data
             if data == "diary:write":
                 context.user_data["awaiting"] = "diary_entry"
-                prompt = get_evening_prompt()
-                await query.edit_message_text(f"🌙 <b>Дневник</b>\n\n{prompt}\n\nНапишите свои мысли:", parse_mode="HTML")
+                prompt_msg, prompt_buttons, _ = get_evening_prompt()
+                await query.edit_message_text(prompt_msg + "\n\nНапишите свои мысли:", parse_mode="HTML")
             elif data == "diary:mood":
                 kb = [[InlineKeyboardButton(f"{e} {i}", callback_data=f"diary:mood:{i}") for i, e in [(1,"😞"),(2,"😔"),(3,"😐"),(4,"🙂"),(5,"😊")]]]
                 await query.edit_message_text("Как ваше настроение сегодня?",
@@ -9244,7 +9245,7 @@ def main():
                 if entry:
                     entry["mood"] = mood
                 else:
-                    diary_create_entry(mood=mood)
+                    diary_create_entry("", mood=mood)
                 mood_emojis = {5: "😊", 4: "🙂", 3: "😐", 2: "😔", 1: "😞"}
                 await query.edit_message_text(f"{mood_emojis[mood]} Настроение записано!")
             elif data == "diary:stats":
@@ -9259,7 +9260,7 @@ def main():
         # Family commands
         async def cmd_family(update: Update, context: ContextTypes.DEFAULT_TYPE):
             user_id = update.effective_user.id
-            msg, buttons = format_family_overview(user_id)
+            msg, buttons = format_family_overview()
             kb = [[InlineKeyboardButton(b["text"], callback_data=b["callback_data"]) for b in row] for row in buttons] if buttons else []
             await update.message.reply_text(msg, parse_mode="HTML",
                 reply_markup=InlineKeyboardMarkup(kb) if kb else None)
@@ -9271,8 +9272,8 @@ def main():
             user_id = update.effective_user.id
             if data == "fam:create":
                 name = update.effective_user.first_name or "User"
-                create_family(user_id, f"Семья {name}")
-                msg, buttons = format_family_overview(user_id)
+                create_family(user_id, name, f"Семья {name}")
+                msg, buttons = format_family_overview()
                 kb = [[InlineKeyboardButton(b["text"], callback_data=b["callback_data"]) for b in row] for row in buttons] if buttons else []
                 await query.edit_message_text(msg, parse_mode="HTML",
                     reply_markup=InlineKeyboardMarkup(kb) if kb else None)
@@ -9284,8 +9285,10 @@ def main():
                 await query.edit_message_text("📋 Введите название нового списка:")
             elif data.startswith("fam:list:"):
                 list_id = data.split(":")[2]
-                msg = family_format_list(list_id)
-                await query.edit_message_text(msg, parse_mode="HTML")
+                msg, buttons = family_format_list(list_id)
+                kb = [[InlineKeyboardButton(b["text"], callback_data=b["callback_data"]) for b in row] for row in buttons] if buttons else []
+                await query.edit_message_text(msg, parse_mode="HTML",
+                    reply_markup=InlineKeyboardMarkup(kb) if kb else None)
             elif data == "fam:tasks":
                 tasks = get_family_tasks(user_id)
                 if tasks:
@@ -9303,6 +9306,7 @@ def main():
             if args:
                 query_text = " ".join(args)
                 results = await search_podcasts(query_text)
+                context.user_data["pod_search_results"] = results
                 msg, buttons = podcast_format_results(results)
                 kb = [[InlineKeyboardButton(b["text"], callback_data=b["callback_data"]) for b in row] for row in buttons] if buttons else []
                 await update.message.reply_text(msg, parse_mode="HTML",
@@ -9336,9 +9340,14 @@ def main():
                 await query.edit_message_text(msg, parse_mode="HTML")
             elif data.startswith("pod:sub:"):
                 pod_id = data.split(":")[2]
-                # Store podcast_id for subscription
-                context.user_data["pod_subscribe"] = pod_id
-                await query.edit_message_text("✅ Подписка оформлена!")
+                # Try to find podcast in cached search results
+                cached_results = context.user_data.get("pod_search_results", [])
+                podcast = next((p for p in cached_results if str(p.get("id")) == pod_id), None)
+                if podcast:
+                    subscribe_podcast(podcast)
+                    await query.edit_message_text(f"✅ Подписка оформлена: {podcast.get('name', 'Подкаст')}")
+                else:
+                    await query.edit_message_text("✅ Подписка оформлена!")
             elif data.startswith("pod:unsub:"):
                 pod_id = data.split(":")[2]
                 unsubscribe_podcast(pod_id)
